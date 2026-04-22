@@ -1,22 +1,39 @@
+# ── IMPORTS ────────────────────────────────────────────────────────────────
+import base64
+import io
+import libtorrent as lt
+import time
+import os
+import sys
+import shutil
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from flask import Flask, request, Response, jsonify
+from flask_cors import CORS
+
+# 🔥 NOVO
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
+# ── ADDONS CONFIG ──────────────────────────────────────────────────────────
 ADDONS = [
     "https://torrentio.strem.fun",
     "https://mediafusion.elfhosted.com",
     "https://comet.elfhosted.com"
 ]
 
-def fetch_json(url):
-    try:
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if res.status_code == 200:
-            return res.json()
-    except Exception as e:
-        print(f"Erro ao buscar {url}: {e}")
-    return None
+# ── SESSION ────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app)
 
+ses = lt.session()
+ses.listen_on(6881, 6891)
 
+DOWNLOAD_PATH = ""
+IS_TEMPORARY = True
+
+# ── ADDONS ENGINE ──────────────────────────────────────────────────────────
 def fetch_addon_streams(addon_url, type_, id_):
     try:
         url = f"{addon_url}/stream/{type_}/{id_}.json"
@@ -52,7 +69,6 @@ def get_all_streams(type_, id_):
             if result:
                 all_streams.extend(result)
 
-    # remove duplicados
     seen = set()
     unique = []
 
@@ -77,11 +93,9 @@ def build_magnet(stream):
     ]
 
     tr = "&".join([f"tr={t}" for t in trackers])
-
     return f"magnet:?xt=urn:btih:{info_hash}&{tr}"
 
-
-# 🔥 FUNÇÃO CENTRAL DE PLAY (CORRIGIDA)
+# ── PLAYER CENTRAL (UNIFICADO) ─────────────────────────────────────────────
 def play_with_magnet(magnet):
     params = {
         'save_path': DOWNLOAD_PATH,
@@ -120,7 +134,6 @@ def play_with_magnet(magnet):
                     chunk = f.read(1024 * 1024)
 
                     if not chunk:
-                        # espera mais dados (torrent ainda baixando)
                         time.sleep(0.5)
                         continue
 
@@ -143,9 +156,27 @@ def play_with_magnet(magnet):
         }
     )
 
+# ── CLEANUP ────────────────────────────────────────────────────────────────
+def cleanup_torrent(handle, file_path):
+    try:
+        ses.remove_torrent(handle)
+    except:
+        pass
 
-# ── ROTAS ─────────────────────────────
+    if IS_TEMPORARY and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except:
+            pass
 
+
+def cleanup_all():
+    if IS_TEMPORARY and os.path.exists(DOWNLOAD_PATH):
+        shutil.rmtree(DOWNLOAD_PATH, ignore_errors=True)
+
+# ── ROTAS ──────────────────────────────────────────────────────────────────
+
+# ✔ PLAY NORMAL
 @app.route("/play")
 def play():
     magnet = request.args.get("magnet")
@@ -155,6 +186,7 @@ def play():
     return play_with_magnet(magnet)
 
 
+# ✔ BUSCAR STREAMS DOS ADDONS
 @app.route("/addons/streams")
 def addon_streams():
     type_ = request.args.get("type", "series")
@@ -181,6 +213,7 @@ def addon_streams():
     })
 
 
+# ✔ PLAY VIA ADDON
 @app.route("/addons/play")
 def addon_play():
     info_hash = request.args.get("infoHash")
@@ -190,3 +223,13 @@ def addon_play():
 
     magnet = f"magnet:?xt=urn:btih:{info_hash}"
     return play_with_magnet(magnet)
+
+# ── MAIN ───────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    DOWNLOAD_PATH = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "TorrentStream")
+    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+
+    print(f"📁 Salvando em: {DOWNLOAD_PATH}")
+    print(f"🚀 Servidor em http://0.0.0.0:5000")
+
+    app.run(host="0.0.0.0", port=5000, threaded=True)
