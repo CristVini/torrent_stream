@@ -9,6 +9,10 @@ jobs:
   build:
     runs-on: windows-latest
 
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
       - name: Checkout código
         uses: actions/checkout@v4
@@ -19,20 +23,18 @@ jobs:
           auto-update-conda: true
           python-version: "3.11"
           activate-environment: torrent-env
+          auto-activate-base: false
 
       - name: Instalar dependências via conda + pip
-        shell: conda-run torrent-env bash -el {0}
         run: |
+          conda activate torrent-env
           conda install -c conda-forge libtorrent -y
           pip install pyinstaller flask
 
       - name: Buildar EXE com PyInstaller
-        shell: conda-run torrent-env bash -el {0}
         run: |
-          pyinstaller --onefile --name torrent_stream \
-            --hidden-import=libtorrent \
-            --collect-binaries=libtorrent \
-            torrent_stream.py
+          conda activate torrent-env
+          pyinstaller --onefile --name torrent_stream --hidden-import=libtorrent --collect-binaries=libtorrent torrent_stream.py
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
