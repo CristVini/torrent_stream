@@ -224,12 +224,37 @@ def addon_play():
     magnet = f"magnet:?xt=urn:btih:{info_hash}"
     return play_with_magnet(magnet)
 
-# ── MAIN ───────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    DOWNLOAD_PATH = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "TorrentStream")
-    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+    result = show_config_window()
+    if not result.get("start"):
+        sys.exit(0)
 
-    print(f"📁 Salvando em: {DOWNLOAD_PATH}")
+    DOWNLOAD_PATH = result["path"]
+    IS_TEMPORARY = result["temporary"]
+
+    mode = "temporário" if IS_TEMPORARY else "permanente"
+    print(f"📁 Salvando em: {DOWNLOAD_PATH} [{mode}]")
     print(f"🚀 Servidor em http://0.0.0.0:5000")
 
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    stop_event = threading.Event()
+
+    # Tray
+    tray_thread = threading.Thread(
+        target=run_tray,
+        args=(DOWNLOAD_PATH, IS_TEMPORARY, stop_event),
+        daemon=True
+    )
+    tray_thread.start()
+
+    # Flask
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True),
+        daemon=True
+    )
+    flask_thread.start()
+
+    # Espera o usuário fechar
+    stop_event.wait()
+    cleanup_all()
+    sys.exit(0)
