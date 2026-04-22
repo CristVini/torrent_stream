@@ -1,0 +1,84 @@
+name: Build Windows EXE (Nuitka)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Instalar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar libtorrent via conda
+        run: |
+          # Instala conda separado só para pegar o libtorrent
+          curl -L -o miniconda.exe https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe
+          Start-Process miniconda.exe -ArgumentList "/S /D=C:\miniconda" -Wait
+          C:\miniconda\Scripts\conda.exe install -c conda-forge libtorrent -y
+
+          # Copia o .pyd e DLLs do libtorrent para o Python do Actions
+          $site = python -c "import site; print(site.getsitepackages()[0])"
+          Write-Host "Site-packages: $site"
+          Copy-Item "C:\miniconda\Lib\site-packages\libtorrent*.pyd" $site -Force
+          Copy-Item "C:\miniconda\Library\bin\torrent-rasterbar*.dll" $site -Force -ErrorAction SilentlyContinue
+          Copy-Item "C:\miniconda\Library\bin\boost_python*.dll" $site -Force -ErrorAction SilentlyContinue
+
+          # Verifica se funcionou
+          python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
+
+      - name: Instalar dependências pip
+        run: pip install flask flask-cors nuitka ordered-set zstandard
+
+      - name: Compilar com Nuitka
+        run: |
+          # Pega o .pyd do libtorrent para incluir manualmente
+          $site = python -c "import site; print(site.getsitepackages()[0])"
+          $lt_pyd = Get-ChildItem -Path $site -Filter "libtorrent*.pyd" | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "libtorrent pyd: $lt_pyd"
+
+          # Monta flag de icone apenas se o arquivo existir
+          $icon_flag = ""
+          if (Test-Path "icon.ico") {
+            $icon_flag = "--windows-icon-from-ico=icon.ico"
+            Write-Host "Icone encontrado, será incluído."
+          } else {
+            Write-Host "icon.ico não encontrado, compilando sem ícone."
+          }
+
+          $nuitka_args = @(
+            "-m", "nuitka",
+            "--onefile",
+            "--standalone",
+            "--output-filename=torrent_stream.exe",
+            "--include-package=flask",
+            "--include-package=flask_cors",
+            "--include-package=werkzeug",
+            "--include-package=jinja2",
+            "--include-package=click",
+            "--include-data-files=$lt_pyd=libtorrent.pyd",
+            "--windows-console-mode=attach"
+          )
+
+          if ($icon_flag) { $nuitka_args += $icon_flag }
+          $nuitka_args += "torrent_stream.py"
+
+          python @nuitka_args
+
+      - name: Upload do EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrent_stream_windows
+          path: torrent_stream.exe
