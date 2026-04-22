@@ -9,24 +9,32 @@ jobs:
   build:
     runs-on: windows-latest
 
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
       - name: Checkout código
         uses: actions/checkout@v4
 
-      - name: Instalar Python 3.11
-        uses: actions/setup-python@v5
+      - name: Instalar Miniconda
+        uses: conda-incubator/setup-miniconda@v3
         with:
+          auto-update-conda: true
           python-version: "3.11"
+          activate-environment: torrent-env
+          auto-activate-base: false
 
-      - name: Instalar dependências
+      - name: Instalar dependências via conda + pip
         run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller flask
-          pip install python-libtorrent
+          conda activate torrent-env
+          conda install -c conda-forge libtorrent -y
+          pip install pyinstaller flask flask-cors
 
       - name: Buildar EXE com PyInstaller
         run: |
-          pyinstaller --onefile --name torrent_stream --hidden-import=libtorrent torrent_stream.py
+          conda activate torrent-env
+          pyinstaller --onefile --name torrent_stream --hidden-import=libtorrent --collect-binaries=libtorrent torrent_stream.py
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4

@@ -1,9 +1,11 @@
 import libtorrent as lt
 import time
 import os
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Permite requisições de qualquer origem (necessário para TV/navegador)
 
 ses = lt.session()
 ses.listen_on(6881, 6891)
@@ -15,7 +17,7 @@ os.makedirs('./downloads', exist_ok=True)
 def play():
     magnet = request.args.get("magnet")
     if not magnet:
-        return "No magnet link provided", 400
+        return jsonify({"error": "No magnet link provided"}), 400
 
     params = {
         'save_path': './downloads',
@@ -32,7 +34,7 @@ def play():
         time.sleep(1)
         elapsed += 1
         if elapsed >= timeout:
-            return "Timeout ao buscar metadata do torrent", 504
+            return jsonify({"error": "Timeout ao buscar metadata do torrent"}), 504
 
     torrent_info = handle.get_torrent_info()
     files = torrent_info.files()
@@ -89,24 +91,28 @@ def play():
         headers={
             'Content-Length': str(file_size),
             'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
         }
     )
 
 
 @app.route("/status")
 def status():
-    """Endpoint para verificar torrents ativos."""
+    """Endpoint para verificar torrents ativos — formato compatível com o radar."""
     torrents = ses.get_torrents()
     result = []
     for h in torrents:
         s = h.status()
         result.append({
             'name': s.name,
-            'progress': f"{s.progress * 100:.1f}%",
-            'download_rate': f"{s.download_rate / 1024:.1f} KB/s",
+            'progress': round(s.progress * 100, 1),       # número, não string
+            'progress_str': f"{s.progress * 100:.1f}%",   # string formatada
+            'download_rate_kbps': round(s.download_rate / 1024, 1),
+            'download_rate_str': f"{s.download_rate / 1024:.1f} KB/s",
             'peers': s.num_peers,
+            'state': str(s.state),
         })
-    return {'torrents': result}
+    return jsonify({"torrents": result})
 
 
 if __name__ == "__main__":
