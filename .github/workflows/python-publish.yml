@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE (Nuitka)
 
 on:
   push:
@@ -25,19 +25,30 @@ jobs:
           activate-environment: torrent-env
           auto-activate-base: false
 
-      - name: Instalar dependências via conda + pip
+      - name: Instalar dependências
         run: |
           conda activate torrent-env
           conda install -c conda-forge libtorrent -y
-          pip install pyinstaller flask
+          pip install flask flask-cors nuitka ordered-set zstandard
 
-      - name: Buildar EXE com PyInstaller
+      - name: Compilar com Nuitka
         run: |
           conda activate torrent-env
-          pyinstaller --onefile --name torrent_stream --hidden-import=libtorrent --collect-binaries=libtorrent torrent_stream.py
+          python -m nuitka `
+            --onefile `
+            --standalone `
+            --output-filename=torrent_stream.exe `
+            --include-package=libtorrent `
+            --include-package=flask `
+            --include-package=flask_cors `
+            --include-package=werkzeug `
+            --include-package=jinja2 `
+            --include-package=click `
+            --windows-console-mode=attach `
+            torrent_stream.py
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
         with:
           name: torrent_stream_windows
-          path: dist/torrent_stream.exe
+          path: torrent_stream.exe
