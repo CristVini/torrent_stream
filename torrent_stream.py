@@ -28,7 +28,7 @@ def save_download_path(path):
 def show_config_window():
     root = tk.Tk()
     root.title("TorrentStream - Configuração")
-    root.geometry("520x320")
+    root.geometry("520x370")
     root.resizable(False, False)
     root.configure(bg="#1e1e2e")
 
@@ -45,7 +45,8 @@ def show_config_window():
     chk_frame.pack(anchor="w", padx=30, pady=(16, 0))
 
     def toggle_entry():
-        entry.config(state="disabled" if temp_var.get() else "normal")
+        # No modo temp o campo fica habilitado para escolher onde salvar o temp
+        entry.config(state="normal")
 
     tk.Checkbutton(
         chk_frame, text="Usar pasta temporária (deletar arquivos ao fechar)",
@@ -54,7 +55,7 @@ def show_config_window():
         font=("Segoe UI", 9), cursor="hand2", command=toggle_entry
     ).pack()
 
-    tk.Label(root, text="Ou escolha uma pasta permanente:",
+    tk.Label(root, text="Pasta para os arquivos (temporários ou permanentes):",
              font=("Segoe UI", 10), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w", padx=30, pady=(12, 4))
 
     frame = tk.Frame(root, bg="#1e1e2e")
@@ -62,31 +63,34 @@ def show_config_window():
 
     entry = tk.Entry(frame, textvariable=selected_path, font=("Segoe UI", 9),
                      bg="#313244", fg="#cdd6f4", insertbackground="white",
-                     relief="flat", bd=6, state="disabled")
+                     relief="flat", bd=6)
     entry.pack(side="left", fill="x", expand=True)
 
     def browse():
         path = filedialog.askdirectory(title="Escolha a pasta de download")
         if path:
             selected_path.set(path)
-            temp_var.set(False)
-            entry.config(state="normal")
 
     tk.Button(frame, text="📂", command=browse, bg="#45475a", fg="#cdd6f4",
               relief="flat", font=("Segoe UI", 10), cursor="hand2",
               padx=8).pack(side="left", padx=(6, 0))
 
+    tk.Label(root, text="⚠ Modo temporário: cria subpasta oculta '.torrentstream_temp' e deleta ao fechar.",
+             font=("Segoe UI", 8), bg="#1e1e2e", fg="#6c7086", wraplength=460).pack(anchor="w", padx=30)
+
     btn_frame = tk.Frame(root, bg="#1e1e2e")
     btn_frame.pack(pady=20)
 
     def start():
+        base = selected_path.get().strip()
+        if not base:
+            messagebox.showwarning("Atenção", "Escolha uma pasta.")
+            return
         if temp_var.get():
-            path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "TorrentStream")
+            # Subpasta temp dentro da pasta escolhida
+            path = os.path.join(base, ".torrentstream_temp")
         else:
-            path = selected_path.get().strip()
-            if not path:
-                messagebox.showwarning("Atenção", "Escolha uma pasta de download.")
-                return
+            path = base
             save_download_path(path)
         os.makedirs(path, exist_ok=True)
         result["start"] = True
@@ -276,9 +280,45 @@ def status():
             'download_rate_kbps': round(s.download_rate / 1024, 1),
             'download_rate_str': f"{s.download_rate/1024:.1f} KB/s",
             'peers': s.num_peers,
+            'upload_rate_kbps': round(s.upload_rate / 1024, 1),
+            'upload_rate_str': f"{s.upload_rate/1024:.1f} KB/s",
             'state': str(s.state),
+            'info_hash': str(s.info_hash).lower(),
         })
-    return jsonify({"torrents": result, "download_path": DOWNLOAD_PATH, "temporary": IS_TEMPORARY})
+    return jsonify({"status": "online", "torrents": result, "download_path": DOWNLOAD_PATH, "temporary": IS_TEMPORARY})
+
+
+@app.route("/ping")
+def ping():
+    """Endpoint leve para checar se o servidor está online."""
+    return jsonify({"status": "online", "version": "1.0.0"})
+
+
+@app.route("/stop", methods=["POST"])
+def stop_torrent():
+    """Para um torrent pelo info_hash e deleta o arquivo se temporário."""
+    data = request.get_json(silent=True) or {}
+    info_hash = data.get("info_hash", "").strip().lower()
+
+    if not info_hash:
+        return jsonify({"error": "info_hash é obrigatório"}), 400
+
+    torrents = ses.get_torrents()
+    for h in torrents:
+        s = h.status()
+        if str(s.info_hash).lower() == info_hash:
+            file_path = None
+            try:
+                ti = h.get_torrent_info()
+                files = ti.files()
+                file_index = max(range(files.num_files()), key=lambda i: files.file_size(i))
+                file_path = os.path.join(DOWNLOAD_PATH, files.file_path(file_index))
+            except Exception:
+                pass
+            threading.Thread(target=cleanup_torrent, args=(h, file_path or ""), daemon=True).start()
+            return jsonify({"success": True, "stopped": s.name})
+
+    return jsonify({"error": "Torrent não encontrado"}), 404
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
