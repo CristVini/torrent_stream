@@ -24,7 +24,7 @@ jobs:
 
       - name: Instalar dependências
         run: |
-          pip install libtorrent flask flask-cors nuitka ordered-set zstandard
+          pip install libtorrent libtorrent-windows-dll flask flask-cors nuitka ordered-set zstandard
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
 
       - name: Compilar com Nuitka
