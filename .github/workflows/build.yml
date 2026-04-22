@@ -29,9 +29,14 @@ jobs:
 
       - name: Compilar com Nuitka
         run: |
-          $site = python -c "import site; print(site.getsitepackages()[0])"
-          $lt_pyd = Get-ChildItem -Path $site -Filter "libtorrent*.pyd" | Select-Object -First 1 -ExpandProperty FullName
-          Write-Host "libtorrent pyd: $lt_pyd"
+          # Descobre onde o libtorrent está instalado
+          $lt_dir = python -c "import libtorrent, os; print(os.path.dirname(libtorrent.__file__))"
+          $lt_file = python -c "import libtorrent; print(libtorrent.__file__)"
+          Write-Host "libtorrent dir: $lt_dir"
+          Write-Host "libtorrent file: $lt_file"
+
+          # Lista todos os arquivos na pasta do libtorrent para debug
+          Get-ChildItem -Path $lt_dir | ForEach-Object { Write-Host $_.FullName }
 
           $nuitka_args = @(
             "-m", "nuitka",
@@ -43,12 +48,11 @@ jobs:
             "--include-package=werkzeug",
             "--include-package=jinja2",
             "--include-package=click",
-            "--include-data-files=$lt_pyd=libtorrent.pyd",
+            "--include-data-files=$lt_file=libtorrent.pyd",
             "--windows-console-mode=attach"
           )
 
           if (Test-Path "icon.ico") {
-            Write-Host "Icone encontrado."
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
