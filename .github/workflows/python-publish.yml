@@ -13,20 +13,26 @@ jobs:
       - name: Checkout código
         uses: actions/checkout@v4
 
-      - name: Instalar Python 3.11
-        uses: actions/setup-python@v5
+      - name: Instalar Miniconda
+        uses: conda-incubator/setup-miniconda@v3
         with:
+          auto-update-conda: true
           python-version: "3.11"
+          activate-environment: torrent-env
 
-      - name: Instalar dependências
+      - name: Instalar dependências via conda + pip
+        shell: conda-run torrent-env bash -el {0}
         run: |
-          python -m pip install --upgrade pip
+          conda install -c conda-forge libtorrent -y
           pip install pyinstaller flask
-          pip install python-libtorrent
 
       - name: Buildar EXE com PyInstaller
+        shell: conda-run torrent-env bash -el {0}
         run: |
-          pyinstaller --onefile --name torrent_stream --hidden-import=libtorrent torrent_stream.py
+          pyinstaller --onefile --name torrent_stream \
+            --hidden-import=libtorrent \
+            --collect-binaries=libtorrent \
+            torrent_stream.py
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
