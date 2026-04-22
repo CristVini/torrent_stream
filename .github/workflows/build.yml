@@ -40,6 +40,7 @@ jobs:
 
           $nuitka_args = @(
             "-m", "nuitka",
+            "--assume-yes-for-downloads",
             "--onefile",
             "--standalone",
             "--output-filename=torrent_stream.exe",
