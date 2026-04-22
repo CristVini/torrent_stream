@@ -31,20 +31,33 @@ jobs:
           conda install -c conda-forge libtorrent -y
           pip install flask flask-cors nuitka ordered-set zstandard
 
-      - name: Compilar com Nuitka
+      - name: Localizar libtorrent e compilar com Nuitka
         run: |
           conda activate torrent-env
+
+          # Descobre onde o conda instalou o libtorrent
+          $lt_path = python -c "import libtorrent, os; print(os.path.dirname(libtorrent.__file__))"
+          Write-Host "libtorrent encontrado em: $lt_path"
+
+          # Localiza o .pyd do libtorrent
+          $lt_pyd = Get-ChildItem -Path $lt_path -Filter "libtorrent*.pyd" | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $lt_pyd) {
+            $lt_pyd = Get-ChildItem -Path $lt_path -Filter "libtorrent*.so" | Select-Object -First 1 -ExpandProperty FullName
+          }
+          Write-Host "libtorrent .pyd: $lt_pyd"
+
           python -m nuitka `
             --onefile `
             --standalone `
             --output-filename=torrent_stream.exe `
-            --include-package=libtorrent `
             --include-package=flask `
             --include-package=flask_cors `
             --include-package=werkzeug `
             --include-package=jinja2 `
             --include-package=click `
+            --include-data-files="$lt_pyd=libtorrent.pyd" `
             --windows-console-mode=attach `
+            --windows-icon-from-ico=icon.ico `
             torrent_stream.py
 
       - name: Upload do EXE
