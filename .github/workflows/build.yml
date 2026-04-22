@@ -22,18 +22,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Instalar libtorrent via wheel pré-compilado
+      - name: Instalar dependências
         run: |
-          # Baixa wheel do libtorrent para Windows/Python 3.11
-          $url = "https://github.com/arvidn/libtorrent/releases/download/v2.0.9/libtorrent_python-2.0.9-cp311-cp311-win_amd64.whl"
-          curl -L -o libtorrent.whl $url
-          pip install libtorrent.whl
-
-          # Verifica se funcionou
+          pip install libtorrent flask flask-cors nuitka ordered-set zstandard
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
-
-      - name: Instalar dependências pip
-        run: pip install flask flask-cors nuitka ordered-set zstandard
 
       - name: Compilar com Nuitka
         run: |
