@@ -24,8 +24,19 @@ jobs:
 
       - name: Instalar dependências
         run: |
-          pip install libtorrent libtorrent-windows-dll flask flask-cors pystray pillow nuitka ordered-set zstandard
+          pip install `
+            libtorrent `
+            libtorrent-windows-dll `
+            flask `
+            flask-cors `
+            requests `
+            pystray `
+            pillow `
+            nuitka `
+            ordered-set `
+            zstandard
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
+          python -c "import requests; print('requests OK:', requests.__version__)"
 
       - name: Compilar com Nuitka
         run: |
@@ -39,25 +50,51 @@ jobs:
             "--assume-yes-for-downloads",
             "--enable-plugin=tk-inter",
             "--output-filename=torrent_stream.exe",
+
+            # Flask stack
             "--include-package=flask",
             "--include-package=flask_cors",
             "--include-package=werkzeug",
             "--include-package=jinja2",
             "--include-package=click",
+            "--include-package=itsdangerous",
+            "--include-package=markupsafe",
+
+            # HTTP client
+            "--include-package=requests",
+            "--include-package=urllib3",
+            "--include-package=certifi",
+            "--include-package=charset_normalizer",
+            "--include-package=idna",
+
+            # libtorrent native extension
             "--include-data-files=$lt_file=libtorrent.pyd",
+
+            # Keep console for debug (change to disable to hide it)
             "--windows-console-mode=attach"
           )
 
           if (Test-Path "icon.ico") {
-            Write-Host "Icone encontrado."
+            Write-Host "Ícone encontrado."
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
           $nuitka_args += "torrent_stream.py"
           python @nuitka_args
 
+      - name: Verificar EXE gerado
+        run: |
+          if (Test-Path "torrent_stream.exe") {
+            $size = (Get-Item "torrent_stream.exe").length / 1MB
+            Write-Host "✅ torrent_stream.exe gerado — $([math]::Round($size,1)) MB"
+          } else {
+            Write-Error "❌ EXE não encontrado!"
+            exit 1
+          }
+
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
         with:
           name: torrent_stream_windows
           path: torrent_stream.exe
+          retention-days: 30
