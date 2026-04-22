@@ -556,7 +556,177 @@ def stop_torrent():
     return jsonify({"error": "Torrent não encontrado"}), 404
 
 
+# ── ID RESOLVERS ─────────────────────────────────────────────────────────────
+
+def resolve_kitsu_id(anime_name: str) -> str | None:
+    """
+    Busca o ID do Kitsu pelo nome do anime usando a API pública do Kitsu.
+    Retorna o ID (ex: "12189") ou None se não encontrar.
+    """
+    try:
+        r = http_requests.get(
+            "https://kitsu.io/api/edge/anime",
+            params={"filter[text]": anime_name, "page[limit]": 1},
+            headers={"Accept": "application/vnd.api+json"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                return data[0]["id"]
+    except Exception as e:
+        print(f"Kitsu resolve error: {e}")
+    return None
+
+
+def resolve_imdb_id(anime_name: str) -> str | None:
+    """
+    Busca o IMDB ID via CINEMETA (catálogo público do Stremio).
+    Retorna o tt-id (ex: "tt0388629") ou None.
+    """
+    try:
+        # Cinemeta search endpoint
+        r = http_requests.get(
+            f"https://v3-cinemeta.strem.io/catalog/series/top/search={http_requests.utils.quote(anime_name)}.json",
+            timeout=8,
+        )
+        if r.status_code == 200:
+            metas = r.json().get("metas", [])
+            if metas:
+                return metas[0].get("id")
+    except Exception as e:
+        print(f"Cinemeta resolve error: {e}")
+    return None
+
+
+def build_series_id(media_id: str, season: int, episode: int) -> str:
+    """
+    Monta o ID no formato esperado pelos addons Stremio para series/anime.
+    - IMDB:  tt0388629:1:1
+    - Kitsu: kitsu:12189:1
+    """
+    if media_id.startswith("tt"):
+        return f"{media_id}:{season}:{episode}"
+    else:
+        # Kitsu usa season implícita, somente episódio global ou S:E
+        return f"kitsu:{media_id}:{season}:{episode}"
+
+
 # ── STREMIO ADDON ROUTES ──────────────────────────────────────────────────────
+
+@app.route("/addons/search")
+def addon_search():
+    """
+    Busca streams por nome do anime + temporada + episódio.
+    Resolve automaticamente Kitsu ID e IMDB ID se não forem fornecidos.
+
+    Query params:
+      name     — nome do anime (ex: "One Piece")
+      season   — número da temporada (default: 1)
+      episode  — número do episódio (default: 1)
+      imdb_id  — (opcional) forçar IMDB ID ex: tt0388629
+      kitsu_id — (opcional) forçar Kitsu ID ex: 12189
+
+    Resposta:
+      {
+        "resolved": { "imdb_id": "tt0388629", "kitsu_id": "12189", "name": "One Piece" },
+        "streams": [ { title, infoHash, magnet, source, fileIdx, quality } ]
+      }
+    """
+    name     = request.args.get("name", "").strip()
+    season   = int(request.args.get("season", 1))
+    episode  = int(request.args.get("episode", 1))
+    imdb_id  = request.args.get("imdb_id", "").strip()
+    kitsu_id = request.args.get("kitsu_id", "").strip()
+
+    if not name and not imdb_id and not kitsu_id:
+        return jsonify({"error": "Forneça 'name', 'imdb_id' ou 'kitsu_id'"}), 400
+
+    resolved = {"name": name, "imdb_id": imdb_id, "kitsu_id": kitsu_id}
+
+    # Resolve IDs se não fornecidos
+    if name and not kitsu_id:
+        kitsu_id = resolve_kitsu_id(name)
+        resolved["kitsu_id"] = kitsu_id
+
+    if name and not imdb_id:
+        imdb_id = resolve_imdb_id(name)
+        resolved["imdb_id"] = imdb_id
+
+    # Monta IDs no formato Stremio para cada fonte
+    ids_to_try = []
+    if imdb_id:
+        ids_to_try.append(("series", build_series_id(imdb_id, season, episode)))
+    if kitsu_id:
+        ids_to_try.append(("series", build_series_id(kitsu_id, season, episode)))
+
+    if not ids_to_try:
+        return jsonify({
+            "error": "Não foi possível resolver IDs para este anime",
+            "resolved": resolved,
+        }), 404
+
+    # Busca em todos os addons com todos os IDs em paralelo
+    all_streams = []
+    tasks = [(addon, mtype, mid) for addon in STREMIO_ADDONS for mtype, mid in ids_to_try]
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+        futures = {ex.submit(_fetch_addon_streams, addon, mtype, mid): (addon, mid)
+                   for addon, mtype, mid in tasks}
+        for future in futures:
+            try:
+                result_streams = future.result()
+                all_streams.extend(result_streams)
+            except Exception:
+                pass
+
+    # Deduplica por infoHash
+    seen, unique = set(), []
+    for s in all_streams:
+        ih = s.get("infoHash")
+        if ih and ih not in seen:
+            seen.add(ih)
+            unique.append(s)
+
+    # Extrai qualidade do título (1080p, 720p, etc.)
+    import re
+    def extract_quality(title: str) -> str:
+        if not title:
+            return ""
+        m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", title or "", re.IGNORECASE)
+        return m.group(1).upper() if m else ""
+
+    def extract_size(title: str) -> str:
+        if not title:
+            return ""
+        m = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", title or "", re.IGNORECASE)
+        return m.group(1) if m else ""
+
+    streams_out = []
+    for s in unique:
+        title = s.get("title", "") or ""
+        streams_out.append({
+            "title":    title,
+            "infoHash": s.get("infoHash"),
+            "magnet":   f"magnet:?xt=urn:btih:{s['infoHash']}" if s.get("infoHash") else None,
+            "source":   s.get("_source", ""),
+            "fileIdx":  s.get("fileIdx"),
+            "quality":  extract_quality(title),
+            "size":     extract_size(title),
+        })
+
+    # Ordena: 1080p primeiro, depois 720p, depois o resto
+    quality_order = {"1080P": 0, "720P": 1, "4K": 2, "2160P": 2, "480P": 3, "360P": 4, "": 5}
+    streams_out.sort(key=lambda s: quality_order.get(s["quality"].upper(), 5))
+
+    return jsonify({
+        "resolved": resolved,
+        "season":   season,
+        "episode":  episode,
+        "total":    len(streams_out),
+        "streams":  streams_out,
+    })
+
 
 @app.route("/addons/streams")
 def addon_streams():
@@ -585,25 +755,101 @@ def addon_streams():
     })
 
 
-@app.route("/addons/play")
-def addon_play():
-    """Fetch streams by infoHash and immediately start streaming. ?infoHash=abc123"""
-    ih = request.args.get("infoHash", "").strip()
-    if not ih:
-        return jsonify({"error": "infoHash é obrigatório"}), 400
+@app.route("/addons/start", methods=["POST"])
+def addon_start():
+    """
+    Endpoint principal de reprodução — recebe a escolha do usuário e devolve
+    tudo que o player precisa em um único JSON.
 
-    magnet = f"magnet:?xt=urn:btih:{ih}"
+    Body JSON:
+      {
+        "infoHash": "abc123...",          -- obrigatório
+        "magnet":   "magnet:?xt=...",     -- opcional (infoHash já é suficiente)
+        "title":    "One Piece S01E01"    -- opcional, para exibição
+      }
+
+    Resposta (JSON):
+      {
+        "info_hash":   "abc123...",
+        "stream_url":  "http://localhost:5000/stream/abc123",
+        "name":        "One Piece - Episode 1.mkv",
+        "file_size_mb": 700.4,
+        "extension":   ".mkv",
+        "content_type": "video/x-matroska",
+        "progress":    5.2,
+        "audio_tracks": [
+          { "index": 0, "language": "jpn", "title": "Japanese", "codec": "AAC",
+            "channels": 2, "channel_label": "Stereo", "is_default": true, "is_forced": false }
+        ],
+        "subtitle_tracks": [
+          { "index": 1, "language": "por", "title": "Português", "codec": "ASS",
+            "is_default": false, "is_forced": false, "is_hearing_impaired": false }
+        ],
+        "ffprobe_available": true
+      }
+
+    O React só precisa:
+      1. Chamar POST /addons/start com o stream escolhido
+      2. Usar stream_url direto no <video src>
+      3. Exibir audio_tracks e subtitle_tracks para o usuário escolher
+      4. Chamar GET /status para polling de progresso (opcional)
+      5. Chamar POST /stop com info_hash ao sair
+    """
+    data     = request.get_json(silent=True) or {}
+    ih       = data.get("infoHash", "").strip().lower()
+    magnet   = data.get("magnet", "").strip()
+    title    = data.get("title", "")
+
+    if not ih and not magnet:
+        return jsonify({"error": "Forneça 'infoHash' ou 'magnet'"}), 400
+
+    # Monta magnet se só tiver hash
+    if not magnet and ih:
+        magnet = f"magnet:?xt=urn:btih:{ih}"
+
+    # ── 1. Bootstrap: metadata + prioridade de arquivo ────────────────────────
     try:
-        handle, _, file_path, file_size, content_type = bootstrap_magnet(magnet)
+        handle, info_hash, file_path, file_size, content_type = bootstrap_magnet(magnet)
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 504
 
+    print(f"▶ Start: {title or info_hash}")
+
+    # ── 2. Aguarda buffer mínimo (~5%) para ffprobe funcionar ──────────────────
     for _ in range(120):
         if handle.status().progress > 0.05:
             break
         time.sleep(1)
 
-    return stream_file_response(file_path, file_size, content_type)
+    # ── 3. Aguarda arquivo existir no disco ────────────────────────────────────
+    for _ in range(30):
+        if os.path.exists(file_path):
+            break
+        time.sleep(1)
+
+    # ── 4. Analisa trilhas via ffprobe ─────────────────────────────────────────
+    tracks = get_track_info(file_path)
+
+    # ── 5. Monta resposta completa ─────────────────────────────────────────────
+    s = handle.status()
+    response = {
+        "info_hash":        info_hash,
+        "stream_url":       f"http://localhost:5000/stream/{info_hash}",
+        "name":             s.name,
+        "title":            title,
+        "file_size_mb":     round(file_size / 1024 / 1024, 1),
+        "extension":        os.path.splitext(file_path)[1].lower(),
+        "content_type":     content_type,
+        "progress":         round(s.progress * 100, 1),
+        **tracks,
+    }
+
+    # Cacheia no active_streams
+    with active_streams_lock:
+        if info_hash in active_streams:
+            active_streams[info_hash]["track_info"] = response
+
+    return jsonify(response)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
