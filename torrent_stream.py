@@ -617,21 +617,8 @@ def build_series_id(media_id: str, season: int, episode: int) -> str:
 @app.route("/addons/search")
 def addon_search():
     """
-    Busca streams por nome do anime + temporada + episódio.
-    Resolve automaticamente Kitsu ID e IMDB ID se não forem fornecidos.
-
-    Query params:
-      name     — nome do anime (ex: "One Piece")
-      season   — número da temporada (default: 1)
-      episode  — número do episódio (default: 1)
-      imdb_id  — (opcional) forçar IMDB ID ex: tt0388629
-      kitsu_id — (opcional) forçar Kitsu ID ex: 12189
-
-    Resposta:
-      {
-        "resolved": { "imdb_id": "tt0388629", "kitsu_id": "12189", "name": "One Piece" },
-        "streams": [ { title, infoHash, magnet, source, fileIdx, quality } ]
-      }
+    Busca generosa: consulta a temporada pedida e a 'Season 1' como fallback,
+    permitindo que o Frontend filtre os resultados reais pelo título.
     """
     name     = request.args.get("name", "").strip()
     season   = int(request.args.get("season", 1))
@@ -644,7 +631,7 @@ def addon_search():
 
     resolved = {"name": name, "imdb_id": imdb_id, "kitsu_id": kitsu_id}
 
-    # Resolve IDs se não fornecidos
+    # 1. Resolve IDs se não fornecidos
     if name and not kitsu_id:
         kitsu_id = resolve_kitsu_id(name)
         resolved["kitsu_id"] = kitsu_id
@@ -653,12 +640,22 @@ def addon_search():
         imdb_id = resolve_imdb_id(name)
         resolved["imdb_id"] = imdb_id
 
-    # Monta IDs no formato Stremio para cada fonte
+    # 2. Monta lista de IDs para busca simultânea (Melhoria de Fallback para Animes)
     ids_to_try = []
+    
     if imdb_id:
-        ids_to_try.append(("series", build_series_id(imdb_id, season, episode)))
+        # Tenta a temporada literal solicitada
+        ids_to_try.append(("series", f"{imdb_id}:{season}:{episode}"))
+        # Fallback para animes que usam numeração absoluta na S01
+        if season > 1:
+            ids_to_try.append(("series", f"{imdb_id}:1:{episode}"))
+
     if kitsu_id:
-        ids_to_try.append(("series", build_series_id(kitsu_id, season, episode)))
+        # No Kitsu, novas temporadas geralmente registram conteúdo como Season 1 do novo ID
+        ids_to_try.append(("series", f"kitsu:{kitsu_id}:1:{episode}"))
+        # Tenta também a temporada literal por segurança
+        if season > 1:
+            ids_to_try.append(("series", f"kitsu:{kitsu_id}:{season}:{episode}"))
 
     if not ids_to_try:
         return jsonify({
@@ -666,7 +663,7 @@ def addon_search():
             "resolved": resolved,
         }), 404
 
-    # Busca em todos os addons com todos os IDs em paralelo
+    # 3. Busca em todos os addons em paralelo
     all_streams = []
     tasks = [(addon, mtype, mid) for addon in STREMIO_ADDONS for mtype, mid in ids_to_try]
 
@@ -676,11 +673,12 @@ def addon_search():
         for future in futures:
             try:
                 result_streams = future.result()
-                all_streams.extend(result_streams)
+                if result_streams:
+                    all_streams.extend(result_streams)
             except Exception:
                 pass
 
-    # Deduplica por infoHash
+    # 4. Deduplicação e Processamento de Títulos
     seen, unique = set(), []
     for s in all_streams:
         ih = s.get("infoHash")
@@ -688,20 +686,18 @@ def addon_search():
             seen.add(ih)
             unique.append(s)
 
-    # Extrai qualidade do título (1080p, 720p, etc.)
     import re
     def extract_quality(title: str) -> str:
-        if not title:
-            return ""
-        m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", title or "", re.IGNORECASE)
+        if not title: return ""
+        m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", title, re.IGNORECASE)
         return m.group(1).upper() if m else ""
 
     def extract_size(title: str) -> str:
-        if not title:
-            return ""
-        m = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", title or "", re.IGNORECASE)
+        if not title: return ""
+        m = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", title, re.IGNORECASE)
         return m.group(1) if m else ""
 
+    # 5. Formata a saída para o Frontend
     streams_out = []
     for s in unique:
         title = s.get("title", "") or ""
@@ -715,7 +711,7 @@ def addon_search():
             "size":     extract_size(title),
         })
 
-    # Ordena: 1080p primeiro, depois 720p, depois o resto
+    # Ordenação por qualidade (1080p primeiro, depois 720p...)
     quality_order = {"1080P": 0, "720P": 1, "4K": 2, "2160P": 2, "480P": 3, "360P": 4, "": 5}
     streams_out.sort(key=lambda s: quality_order.get(s["quality"].upper(), 5))
 
@@ -726,8 +722,7 @@ def addon_search():
         "total":    len(streams_out),
         "streams":  streams_out,
     })
-
-
+    
 @app.route("/addons/streams")
 def addon_streams():
     """
