@@ -13,6 +13,8 @@ from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
 import requests as http_requests
 from concurrent.futures import ThreadPoolExecutor
+import subprocess  # Adicione esta linha
+import json
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 STREMIO_ADDONS = [
@@ -440,6 +442,63 @@ def get_all_addon_streams(media_type, media_id):
 def ping():
     return jsonify({"status": "online", "version": "2.1.0"})
 
+# ── METADADOS E MULTI-ÁUDIO ──────────────────────────────────────────────────
+@app.route("/stream/metadata")
+def get_metadata():
+    """
+    Analisa o arquivo via FFprobe para detectar faixas de áudio e legendas.
+    O Front-end usa isso para montar o seletor dinâmico.
+    """
+    stream_url = request.args.get("url")
+    if not stream_url:
+        return jsonify({"error": "URL de stream necessária"}), 400
+
+    try:
+        # Comando FFprobe para extrair apenas informações de streams (áudio e legenda)
+        cmd = [
+            'ffprobe', 
+            '-v', 'quiet', 
+            '-print_format', 'json', 
+            '-show_streams', 
+            '-select_streams', 'a', # Seleciona apenas áudio inicialmente para o menu
+            stream_url
+        ]
+        
+        # Executa o processo de análise (requer FFmpeg instalado no PC)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        probe_data = json.loads(result.stdout)
+        
+        audio_tracks = []
+        for i, stream in enumerate(probe_data.get("streams", [])):
+            audio_tracks.append({
+                "index": stream.get("index"),
+                "id": i,
+                "codec": stream.get("codec_name"),
+                "language": stream.get("tags", {}).get("language", "und"),
+                "title": stream.get("tags", {}).get("title", f"Áudio {i+1}"),
+                "channels": stream.get("channels")
+            })
+
+        return jsonify({
+            "has_multi_audio": len(audio_tracks) > 1,
+            "audio_tracks": audio_tracks,
+            "format": probe_data.get("format", {})
+        })
+
+    except Exception as e:
+        print(f"🔥 Erro no FFprobe: {e}")
+        return jsonify({"error": "Falha ao analisar metadados", "details": str(e)}), 500
+
+@app.route("/stream/config")
+def stream_config():
+    """
+    Endpoint auxiliar para o Front-end salvar preferências de áudio/legenda
+    """
+    return jsonify({
+        "supported_codecs": ["aac", "ac3", "mp3", "opus"],
+        "dual_audio_enabled": True,
+        "engine_version": "2.1.0-pro"
+    })
 
 @app.route("/play")
 def play():
