@@ -12,9 +12,11 @@ from tkinter import filedialog, messagebox
 from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
 import requests as http_requests
-from concurrent.futures import ThreadPoolExecutor
-import subprocess  # Adicione esta linha
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
 import json
+import re
+from typing import Optional, List, Dict, Any
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 STREMIO_ADDONS = [
@@ -22,6 +24,12 @@ STREMIO_ADDONS = [
     "https://mediafusion.elfhosted.com",
     "https://comet.elfhosted.com",
 ]
+
+ADDON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://web.stremio.com/",
+}
 
 CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), "torrent_stream_config.txt")
 
@@ -34,8 +42,14 @@ CONTENT_TYPES = {
     ".m4v":  "video/mp4",
     ".ts":   "video/mp2t",
 }
-
 VIDEO_EXTS = set(CONTENT_TYPES.keys())
+
+QUALITY_ORDER = {"4K": 0, "2160P": 0, "1080P": 1, "720P": 2, "480P": 3, "SD": 4}
+
+# Nyaa categories
+NYAA_CAT_ANIME      = 1   # Anime (all)
+NYAA_CAT_ANIME_EN   = 12  # Anime - English-translated
+NYAA_CAT_ANIME_RAW  = 14  # Anime - Raw (for DUB detection)
 
 # ── FLASK + SESSION ─────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -47,12 +61,11 @@ ses.listen_on(6881, 6891)
 DOWNLOAD_PATH = ""
 IS_TEMPORARY  = True
 
-# info_hash (lower) -> {handle, file_path, file_size, content_type, track_info}
-active_streams      = {}
+active_streams: Dict[str, Any] = {}
 active_streams_lock = threading.Lock()
 
 # ── CONFIG FILE ─────────────────────────────────────────────────────────────
-def load_download_path():
+def load_download_path() -> str:
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             p = f.read().strip()
@@ -60,12 +73,12 @@ def load_download_path():
                 return p
     return os.path.join(os.environ.get("TEMP", "/tmp"), "TorrentStream")
 
-def save_download_path(path):
+def save_download_path(path: str) -> None:
     with open(CONFIG_FILE, "w") as f:
         f.write(path)
 
 # ── CONFIG WINDOW ───────────────────────────────────────────────────────────
-def show_config_window():
+def show_config_window() -> dict:
     root = tk.Tk()
     root.title("TorrentStream – Configuração")
     root.geometry("520x370")
@@ -158,7 +171,7 @@ def show_config_window():
     return result
 
 # ── SYSTEM TRAY ─────────────────────────────────────────────────────────────
-def run_tray(download_path, is_temporary, stop_event):
+def run_tray(download_path: str, is_temporary: bool, stop_event: threading.Event) -> None:
     try:
         import pystray
         from PIL import Image as PILImage
@@ -199,7 +212,7 @@ def run_tray(download_path, is_temporary, stop_event):
         stop_event.wait()
 
 # ── CLEANUP ─────────────────────────────────────────────────────────────────
-def cleanup_torrent(handle, file_path):
+def cleanup_torrent(handle, file_path: str) -> None:
     try:
         ses.remove_torrent(handle)
     except Exception:
@@ -213,17 +226,14 @@ def cleanup_torrent(handle, file_path):
         except Exception as e:
             print(f"Erro ao deletar: {e}")
 
-def cleanup_all():
+def cleanup_all() -> None:
     if IS_TEMPORARY and os.path.exists(DOWNLOAD_PATH):
         shutil.rmtree(DOWNLOAD_PATH, ignore_errors=True)
         print(f"🗑 Pasta temporária deletada: {DOWNLOAD_PATH}")
 
 # ── FFPROBE: TRACK INFO ─────────────────────────────────────────────────────
-def get_track_info(file_path):
-    import subprocess
-    import json
-
-    result = {"audio_tracks": [], "subtitle_tracks": [], "ffprobe_available": False}
+def get_track_info(file_path: str) -> dict:
+    result: dict = {"audio_tracks": [], "subtitle_tracks": [], "ffprobe_available": False}
     try:
         proc = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", file_path],
@@ -243,9 +253,9 @@ def get_track_info(file_path):
 
             if ct == "audio":
                 ch = s.get("channels", 0)
-                ch_label = {
-                    1: "Mono", 2: "Stereo", 6: "5.1 Surround", 8: "7.1 Surround"
-                }.get(ch, f"{ch}ch" if ch else s.get("channel_layout", ""))
+                ch_label = {1: "Mono", 2: "Stereo", 6: "5.1 Surround", 8: "7.1 Surround"}.get(
+                    ch, f"{ch}ch" if ch else s.get("channel_layout", "")
+                )
                 result["audio_tracks"].append({
                     "index":          idx,
                     "language":       lang,
@@ -256,8 +266,8 @@ def get_track_info(file_path):
                     "channel_label":  ch_label,
                     "sample_rate":    s.get("sample_rate", ""),
                     "bit_rate":       s.get("bit_rate", ""),
-                    "is_default":     s.get("disposition", {}).get("default",          0) == 1,
-                    "is_forced":      s.get("disposition", {}).get("forced",           0) == 1,
+                    "is_default":     s.get("disposition", {}).get("default", 0) == 1,
+                    "is_forced":      s.get("disposition", {}).get("forced",  0) == 1,
                 })
             elif ct == "subtitle":
                 result["subtitle_tracks"].append({
@@ -270,21 +280,20 @@ def get_track_info(file_path):
                     "is_hearing_impaired": s.get("disposition", {}).get("hearing_impaired",  0) == 1,
                 })
     except FileNotFoundError:
-        pass  # ffprobe not installed
+        print("⚠ ffprobe não encontrado — instale FFmpeg e adicione ao PATH")
     except Exception as e:
         print(f"ffprobe error: {e}")
 
     return result
 
 # ── RANGE-AWARE STREAMING ────────────────────────────────────────────────────
-def stream_file_response(file_path, file_size, content_type):
-    """Returns a Flask Response with proper Range / 206 support for MKV seeking."""
+def stream_file_response(file_path: str, file_size: int, content_type: str) -> Response:
     range_header = request.headers.get("Range")
 
     base_headers = {
-        "Accept-Ranges":                "bytes",
-        "Content-Type":                 content_type,
-        "Access-Control-Allow-Origin":  "*",
+        "Accept-Ranges":                 "bytes",
+        "Content-Type":                  content_type,
+        "Access-Control-Allow-Origin":   "*",
         "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
     }
 
@@ -327,11 +336,6 @@ def stream_file_response(file_path, file_size, content_type):
 
 # ── TORRENT BOOTSTRAP ────────────────────────────────────────────────────────
 def bootstrap_magnet(magnet: str):
-    """
-    Adds a magnet URI, waits for metadata, selects the largest video file,
-    registers in active_streams, returns (handle, info_hash, file_path, file_size, content_type).
-    Raises RuntimeError on timeout.
-    """
     params = {"save_path": DOWNLOAD_PATH, "storage_mode": lt.storage_mode_t(2)}
     handle = lt.add_magnet_uri(ses, magnet, params)
 
@@ -340,12 +344,11 @@ def bootstrap_magnet(magnet: str):
             break
         time.sleep(1)
     else:
-        raise RuntimeError("Timeout ao buscar metadata")
+        raise RuntimeError("Timeout ao buscar metadata do torrent")
 
     ti    = handle.get_torrent_info()
     files = ti.files()
 
-    # Prefer largest video file; fall back to absolute largest
     best_idx, best_size = -1, -1
     for i in range(files.num_files()):
         ext  = os.path.splitext(files.file_path(i))[1].lower()
@@ -378,151 +381,448 @@ def bootstrap_magnet(magnet: str):
     print(f"▶ {os.path.basename(file_path)}  ({file_size/1024/1024:.1f} MB)  [{content_type}]  hash={info_hash}")
     return handle, info_hash, file_path, file_size, content_type
 
-# ── STREMIO ADDON ENGINE ─────────────────────────────────────────────────────
-def _fetch_addon_streams(addon_url, media_type, media_id):
-    # 1. Limpeza rigorosa da URL base
-    base_url = addon_url.replace("/manifest.json", "").rstrip("/")
-    target_url = f"{base_url}/stream/{media_type}/{media_id}.json"
-    
-    # 2. Headers idênticos ao teste (O SEGREDO DO SUCESSO)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Referer": "https://web.stremio.com/"
-    }
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def _extract_quality(title: str) -> str:
+    m = re.search(r"(4K|2160p|1080p|720p|480p)", title or "", re.IGNORECASE)
+    return m.group(1).upper() if m else "SD"
 
-    try:
-        # Usamos http_requests ou requests normal, dependendo de como importou
-        r = http_requests.get(target_url, headers=headers, timeout=12)
-        
-        if r.status_code == 200:
-            # Tratamento de JSON seguro para evitar o erro "line 1 column 1"
-            try:
-                data = r.json()
-                streams = data.get("streams", [])
-                for s in streams:
-                    s["_source"] = addon_url
-                return streams
-            except ValueError:
-                print(f"❌ Erro de decodificação JSON em {addon_url}")
-                return []
-        else:
-            print(f"⚠️ Addon {addon_url} retornou status {r.status_code}")
-            
-    except Exception as e:
-        print(f"❗ Falha de conexão com {addon_url}: {e}")
-    
-    return []
+def _extract_size(title: str) -> str:
+    m = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB|MiB|GiB))", title or "", re.IGNORECASE)
+    return m.group(1) if m else ""
 
-def get_all_addon_streams(media_type, media_id):
-    all_streams = []
-    # Usar a lista global de addons que você definiu (Torrentio, Comet, etc)
-    with ThreadPoolExecutor(max_workers=len(STREMIO_ADDONS)) as ex:
-        # O map vai rodar o _fetch_addon_streams para cada addon
-        results = ex.map(lambda a: _fetch_addon_streams(a, media_type, media_id), STREMIO_ADDONS)
-        
-        for batch in results:
-            if batch: # Só adiciona se houver resultados
-                all_streams.extend(batch)
-
-    # Lógica de remoção de duplicatas por infoHash
+def _deduplicate(streams: List[dict]) -> List[dict]:
     seen, unique = set(), []
-    for s in all_streams:
+    for s in streams:
         ih = s.get("infoHash")
         if ih and ih not in seen:
             seen.add(ih)
             unique.append(s)
-    
-    print(f"📦 Total de streams encontrados: {len(unique)}")
     return unique
+
+def _sort_streams(streams: List[dict]) -> List[dict]:
+    return sorted(streams, key=lambda s: QUALITY_ORDER.get(s.get("quality", "SD"), 4))
+
+# ── NYAA ENGINE ───────────────────────────────────────────────────────────────
+def _nyaa_detect_type(name: str) -> str:
+    """
+    Detecta se o resultado é dublado, legendado ou raw pelo nome do arquivo/grupo.
+    Retorna: "DUB" | "SUB" | "RAW" | ""
+    """
+    n = name.lower()
+    if any(x in n for x in ["dual audio", "dual-audio", "dub", "dubbed", "pt-br", "ptbr"]):
+        return "DUB"
+    if any(x in n for x in ["legendado", "leg.", "[pt]", "portuguese"]):
+        return "DUB"  # português legendado também é DUB para fins de filtragem
+    if any(x in n for x in ["sub", "subtitled", "english-translated", "horriblesubs",
+                              "subsplease", "erai-raws"]):
+        return "SUB"
+    if any(x in n for x in ["raw", "uncensored"]):
+        return "RAW"
+    return "SUB"  # padrão: assume legendado
+
+def search_nyaa(keyword: str, episode: Optional[int] = None,
+                season: Optional[int] = None,
+                trusted_only: bool = False) -> List[dict]:
+    """
+    Busca no Nyaa.si via NyaaPy.
+    Constrói keyword inteligente: "Anime Name S01E01" ou "Anime Name episode 1".
+    Retorna lista normalizada no mesmo formato dos streams Stremio.
+    """
+    try:
+        from nyaapy.nyaasi.nyaa import Nyaa
+    except ImportError:
+        print("⚠ NyaaPy não instalado — pip install nyaapy")
+        return []
+
+    try:
+        # Monta query com episódio se fornecido
+        query = keyword.strip()
+        if season and season > 1:
+            query += f" S{season:02d}"
+        if episode:
+            if season and season > 1:
+                query += f"E{episode:02d}"
+            else:
+                # Season 1: usa formato "- 01" que é padrão no Nyaa para animes
+                query += f" - {episode:02d}"
+
+        filters = 2 if trusted_only else 0  # 2 = Trusted only, 0 = sem filtro
+
+        print(f"🔍 Nyaa search: '{query}' filters={filters}")
+
+        # Busca em categoria Anime (inclui sub e dub)
+        results = Nyaa.search(keyword=query, category=NYAA_CAT_ANIME, filters=filters)
+
+        streams = []
+        for r in results:
+            name    = r.name if hasattr(r, "name") else str(r.get("name", ""))
+            magnet  = r.magnet if hasattr(r, "magnet") else r.get("magnet", "")
+            size    = r.size if hasattr(r, "size") else r.get("size", "")
+            seeders = r.seeders if hasattr(r, "seeders") else r.get("seeders", "0")
+
+            if not magnet:
+                continue
+
+            # Extrai info_hash do magnet
+            ih_match = re.search(r"btih:([a-fA-F0-9]{40})", magnet, re.IGNORECASE)
+            if not ih_match:
+                continue
+            ih = ih_match.group(1).lower()
+
+            quality  = _extract_quality(name)
+            dub_type = _nyaa_detect_type(name)
+
+            streams.append({
+                "title":    name,
+                "infoHash": ih,
+                "magnet":   magnet,
+                "source":   "nyaa.si",
+                "quality":  quality,
+                "size":     size,
+                "seeders":  int(seeders) if str(seeders).isdigit() else 0,
+                "dub_type": dub_type,   # "DUB" | "SUB" | "RAW"
+                "fileIdx":  None,
+            })
+
+        # Ordena por seeders (mais seeds primeiro dentro de cada qualidade)
+        streams.sort(key=lambda s: (-QUALITY_ORDER.get(s["quality"], 4), -s.get("seeders", 0)))
+        print(f"🌸 Nyaa: {len(streams)} resultados para '{query}'")
+        return streams
+
+    except Exception as e:
+        print(f"❗ Nyaa search error: {e}")
+        return []
+
+# ── STREMIO ADDON ENGINE ─────────────────────────────────────────────────────
+def _fetch_addon_streams(addon_url: str, media_type: str, media_id: str) -> List[dict]:
+    base_url   = addon_url.rstrip("/").replace("/manifest.json", "")
+    target_url = f"{base_url}/stream/{media_type}/{media_id}.json"
+
+    try:
+        r = http_requests.get(target_url, headers=ADDON_HEADERS, timeout=12)
+        if r.status_code == 200:
+            try:
+                streams = r.json().get("streams", [])
+                for s in streams:
+                    s["_source"] = addon_url
+                return streams
+            except ValueError:
+                print(f"❌ JSON inválido de {addon_url}")
+        else:
+            print(f"⚠ {addon_url} retornou {r.status_code}")
+    except Exception as e:
+        print(f"❗ Falha em {addon_url}: {e}")
+
+    return []
+
+def _normalize_stremio_stream(s: dict) -> dict:
+    title = s.get("title", "") or ""
+    return {
+        "title":    title,
+        "infoHash": s.get("infoHash"),
+        "magnet":   f"magnet:?xt=urn:btih:{s['infoHash']}" if s.get("infoHash") else None,
+        "source":   s.get("_source", ""),
+        "fileIdx":  s.get("fileIdx"),
+        "quality":  _extract_quality(title),
+        "size":     _extract_size(title),
+        "seeders":  0,
+        "dub_type": _nyaa_detect_type(title),
+    }
+
+# ── ID RESOLVERS ─────────────────────────────────────────────────────────────
+def resolve_imdb_id(anime_name: str) -> Optional[str]:
+    try:
+        url = f"https://v3-cinemeta.strem.io/catalog/series/top/search={http_requests.utils.quote(anime_name)}.json"
+        r = http_requests.get(url, timeout=8)
+        if r.status_code == 200:
+            metas = r.json().get("metas", [])
+            if metas:
+                iid = metas[0].get("id")
+                print(f"✅ IMDB ID: {iid} para '{anime_name}'")
+                return iid
+    except Exception as e:
+        print(f"Cinemeta resolve error: {e}")
+    return None
+
+def resolve_kitsu_id(anime_name: str) -> Optional[str]:
+    try:
+        r = http_requests.get(
+            "https://kitsu.io/api/edge/anime",
+            params={"filter[text]": anime_name, "page[limit]": 1},
+            headers={"Accept": "application/vnd.api+json"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                kid = data[0]["id"]
+                print(f"✅ Kitsu ID: {kid} para '{anime_name}'")
+                return kid
+    except Exception as e:
+        print(f"Kitsu resolve error: {e}")
+    return None
+
+def build_stremio_ids(imdb_id: Optional[str], kitsu_id: Optional[str],
+                      season: int, episode: int) -> List[str]:
+    """
+    Monta todos os IDs no formato Stremio.
+    Inclui fallback Season 1 pois muitos animes ficam indexados assim nos addons.
+    """
+    ids = []
+    if imdb_id:
+        ids.append(f"{imdb_id}:{season}:{episode}")
+        if season > 1:
+            ids.append(f"{imdb_id}:1:{episode}")
+    if kitsu_id:
+        ids.append(f"kitsu:{kitsu_id}:{season}:{episode}")
+        if season > 1:
+            ids.append(f"kitsu:{kitsu_id}:1:{episode}")
+    return ids
+
+# ── COMBINED SEARCH ────────────────────────────────────────────────────────────
+def search_all_sources(
+    name: str,
+    season: int,
+    episode: int,
+    imdb_id: Optional[str],
+    kitsu_id: Optional[str],
+    use_nyaa: bool = True,
+    nyaa_trusted: bool = False,
+) -> List[dict]:
+    """
+    Busca em paralelo: Stremio addons (Torrentio, Comet, etc.) + Nyaa.si.
+    Deduplica por infoHash e ordena por qualidade.
+    """
+    all_streams: List[dict] = []
+    futures_map = {}
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+
+        # ── Stremio addons ──────────────────────────────────────────────────
+        if imdb_id or kitsu_id:
+            ids_to_try = build_stremio_ids(imdb_id, kitsu_id, season, episode)
+            for addon in STREMIO_ADDONS:
+                for mid in ids_to_try:
+                    fut = ex.submit(_fetch_addon_streams, addon, "series", mid)
+                    futures_map[fut] = ("stremio", addon)
+
+        # ── Nyaa.si ─────────────────────────────────────────────────────────
+        if use_nyaa and name:
+            fut = ex.submit(search_nyaa, name, episode, season, nyaa_trusted)
+            futures_map[fut] = ("nyaa", "nyaa.si")
+
+        for future in as_completed(futures_map):
+            source_type, source_name = futures_map[future]
+            try:
+                batch = future.result()
+                if source_type == "stremio":
+                    all_streams.extend([_normalize_stremio_stream(s) for s in batch])
+                else:
+                    all_streams.extend(batch)  # Nyaa já vem normalizado
+            except Exception as e:
+                print(f"❗ Erro em {source_name}: {e}")
+
+    unique = _deduplicate(all_streams)
+    sorted_streams = _sort_streams(unique)
+    print(f"📦 Total final: {len(sorted_streams)} streams únicos")
+    return sorted_streams
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 
 @app.route("/ping")
 def ping():
-    return jsonify({"status": "online", "version": "2.1.0"})
+    return jsonify({"status": "online", "version": "3.0.0"})
 
-# ── METADADOS E MULTI-ÁUDIO ──────────────────────────────────────────────────
-@app.route("/stream/metadata")
-def get_metadata():
+
+# ── /addons/search ────────────────────────────────────────────────────────────
+@app.route("/addons/search")
+def addon_search():
     """
-    Analisa o arquivo via FFprobe para detectar faixas de áudio e legendas.
-    O Front-end usa isso para montar o seletor dinâmico.
+    Busca streams por nome + temporada + episódio.
+    Consulta Stremio addons E Nyaa.si em paralelo.
+
+    Query params:
+      name         — nome do anime (ex: "One Piece")
+      season       — temporada (default: 1)
+      episode      — episódio (default: 1)
+      imdb_id      — (opcional) IMDB ID ex: tt0388629
+      kitsu_id     — (opcional) Kitsu ID ex: 12189
+      nyaa         — "true" | "false" (default: true) — incluir Nyaa.si
+      nyaa_trusted — "true" | "false" (default: false) — somente trusted no Nyaa
+
+    Resposta:
+      {
+        "total": 18,
+        "streams": [
+          {
+            "title":    "[SubsPlease] One Piece - 1001 (1080p)",
+            "infoHash": "abc123...",
+            "magnet":   "magnet:?xt=urn:btih:abc123",
+            "source":   "nyaa.si" | "https://torrentio.strem.fun",
+            "quality":  "1080P" | "720P" | "SD",
+            "size":     "317.2 MiB",
+            "seeders":  538,
+            "dub_type": "SUB" | "DUB" | "RAW",
+            "fileIdx":  null
+          }
+        ],
+        "meta": { name, imdb_id, kitsu_id, season, episode }
+      }
     """
-    stream_url = request.args.get("url")
-    if not stream_url:
-        return jsonify({"error": "URL de stream necessária"}), 400
+    name         = request.args.get("name", "").strip()
+    season       = int(request.args.get("season", 1))
+    episode      = int(request.args.get("episode", 1))
+    imdb_id      = request.args.get("imdb_id",  "").strip() or None
+    kitsu_id     = request.args.get("kitsu_id", "").strip() or None
+    use_nyaa     = request.args.get("nyaa", "true").lower() != "false"
+    nyaa_trusted = request.args.get("nyaa_trusted", "false").lower() == "true"
 
-    try:
-        # Comando FFprobe para extrair apenas informações de streams (áudio e legenda)
-        cmd = [
-            'ffprobe', 
-            '-v', 'quiet', 
-            '-print_format', 'json', 
-            '-show_streams', 
-            '-select_streams', 'a', # Seleciona apenas áudio inicialmente para o menu
-            stream_url
-        ]
-        
-        # Executa o processo de análise (requer FFmpeg instalado no PC)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        probe_data = json.loads(result.stdout)
-        
-        audio_tracks = []
-        for i, stream in enumerate(probe_data.get("streams", [])):
-            audio_tracks.append({
-                "index": stream.get("index"),
-                "id": i,
-                "codec": stream.get("codec_name"),
-                "language": stream.get("tags", {}).get("language", "und"),
-                "title": stream.get("tags", {}).get("title", f"Áudio {i+1}"),
-                "channels": stream.get("channels")
-            })
+    if not name and not imdb_id and not kitsu_id:
+        return jsonify({"error": "Forneça 'name', 'imdb_id' ou 'kitsu_id'"}), 400
 
-        return jsonify({
-            "has_multi_audio": len(audio_tracks) > 1,
-            "audio_tracks": audio_tracks,
-            "format": probe_data.get("format", {})
-        })
+    # Resolve IDs em paralelo se não fornecidos
+    if name and (not imdb_id or not kitsu_id):
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_imdb  = ex.submit(resolve_imdb_id,  name) if not imdb_id  else None
+            fut_kitsu = ex.submit(resolve_kitsu_id, name) if not kitsu_id else None
+            if fut_imdb:
+                imdb_id  = fut_imdb.result()
+            if fut_kitsu:
+                kitsu_id = fut_kitsu.result()
 
-    except Exception as e:
-        print(f"🔥 Erro no FFprobe: {e}")
-        return jsonify({"error": "Falha ao analisar metadados", "details": str(e)}), 500
+    streams = search_all_sources(
+        name=name,
+        season=season,
+        episode=episode,
+        imdb_id=imdb_id,
+        kitsu_id=kitsu_id,
+        use_nyaa=use_nyaa,
+        nyaa_trusted=nyaa_trusted,
+    )
 
-@app.route("/stream/config")
-def stream_config():
-    """
-    Endpoint auxiliar para o Front-end salvar preferências de áudio/legenda
-    """
     return jsonify({
-        "supported_codecs": ["aac", "ac3", "mp3", "opus"],
-        "dual_audio_enabled": True,
-        "engine_version": "2.1.0-pro"
+        "total":   len(streams),
+        "streams": streams,
+        "meta": {
+            "name":     name,
+            "imdb_id":  imdb_id,
+            "kitsu_id": kitsu_id,
+            "season":   season,
+            "episode":  episode,
+        },
     })
 
-@app.route("/play")
-def play():
-    """Start download + stream. Use /stream/<hash> for seeking afterwards."""
-    magnet = request.args.get("magnet", "").strip()
-    if not magnet:
-        return jsonify({"error": "magnet é obrigatório"}), 400
+
+# ── /nyaa/search ─────────────────────────────────────────────────────────────
+@app.route("/nyaa/search")
+def nyaa_search_route():
+    """
+    Busca direta no Nyaa.si, sem Stremio addons.
+    Útil para buscar por nome exato, group release, etc.
+
+    Query params:
+      q            — keyword livre (ex: "SubsPlease One Piece 1080p")
+      episode      — número do episódio (opcional)
+      season       — temporada (opcional)
+      trusted      — "true" | "false" (default: false)
+
+    Resposta: mesma estrutura de /addons/search
+    """
+    q            = request.args.get("q", "").strip()
+    episode      = request.args.get("episode", type=int)
+    season       = request.args.get("season",  type=int)
+    trusted      = request.args.get("trusted", "false").lower() == "true"
+
+    if not q:
+        return jsonify({"error": "Parâmetro 'q' é obrigatório"}), 400
+
+    streams = search_nyaa(q, episode=episode, season=season, trusted_only=trusted)
+    return jsonify({"total": len(streams), "streams": streams})
+
+
+# ── /addons/start ─────────────────────────────────────────────────────────────
+@app.route("/addons/start", methods=["POST"])
+def addon_start():
+    """
+    Inicia o download e devolve tudo que o player precisa em um único JSON.
+
+    Body JSON:
+      { "infoHash": "abc123", "magnet": "magnet:?xt=...", "title": "..." }
+
+    Resposta:
+      {
+        "info_hash":        "abc123...",
+        "stream_url":       "http://localhost:5000/stream/abc123",
+        "name":             "One Piece - Episode 1001.mkv",
+        "title":            "título original do stream",
+        "file_size_mb":     700.4,
+        "extension":        ".mkv",
+        "content_type":     "video/x-matroska",
+        "progress":         5.2,
+        "audio_tracks":     [...],
+        "subtitle_tracks":  [...],
+        "ffprobe_available": true
+      }
+    """
+    data   = request.get_json(silent=True) or {}
+    ih     = data.get("infoHash", "").strip().lower()
+    magnet = data.get("magnet",   "").strip()
+    title  = data.get("title",    "")
+
+    if not ih and not magnet:
+        return jsonify({"error": "Forneça 'infoHash' ou 'magnet'"}), 400
+
+    if not magnet and ih:
+        magnet = f"magnet:?xt=urn:btih:{ih}"
+
     try:
-        handle, _, file_path, file_size, content_type = bootstrap_magnet(magnet)
+        handle, info_hash, file_path, file_size, content_type = bootstrap_magnet(magnet)
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 504
 
-    # Wait for initial buffer (~5 %)
+    print(f"▶ Start: {title or info_hash}")
+
+    # Aguarda buffer mínimo (~5%) para ffprobe conseguir ler o container
     for _ in range(120):
         if handle.status().progress > 0.05:
             break
         time.sleep(1)
 
-    return stream_file_response(file_path, file_size, content_type)
+    # Aguarda arquivo existir no disco
+    for _ in range(30):
+        if os.path.exists(file_path):
+            break
+        time.sleep(1)
+
+    tracks = get_track_info(file_path)
+
+    s = handle.status()
+    resp = {
+        "info_hash":        info_hash,
+        "stream_url":       f"http://localhost:5000/stream/{info_hash}",
+        "name":             s.name,
+        "title":            title,
+        "file_size_mb":     round(file_size / 1024 / 1024, 1),
+        "extension":        os.path.splitext(file_path)[1].lower(),
+        "content_type":     content_type,
+        "progress":         round(s.progress * 100, 1),
+        **tracks,
+    }
+
+    with active_streams_lock:
+        if info_hash in active_streams:
+            active_streams[info_hash]["track_info"] = resp
+
+    return jsonify(resp)
 
 
+# ── /stream/<hash> ────────────────────────────────────────────────────────────
 @app.route("/stream/<info_hash>")
 def stream_by_hash(info_hash):
-    """Range-ready stream endpoint — set this as your <video> src."""
+    """
+    Range-ready stream. Use diretamente como <video src>.
+    Suporta seeking em MKV via HTTP 206 Partial Content.
+    """
     info_hash = info_hash.lower()
     with active_streams_lock:
         entry = active_streams.get(info_hash)
@@ -533,56 +833,7 @@ def stream_by_hash(info_hash):
     return stream_file_response(entry["file_path"], entry["file_size"], entry["content_type"])
 
 
-@app.route("/info/<info_hash>")
-def track_info(info_hash):
-    """Returns ffprobe track info (audio channels, subtitles, codecs)."""
-    info_hash = info_hash.lower()
-    with active_streams_lock:
-        entry = active_streams.get(info_hash)
-    if not entry:
-        return jsonify({"error": "Torrent não encontrado"}), 404
-
-    # Return cached result
-    if entry.get("track_info"):
-        return jsonify(entry["track_info"])
-
-    file_path = entry["file_path"]
-    handle    = entry["handle"]
-
-    for _ in range(30):
-        if os.path.exists(file_path):
-            break
-        time.sleep(1)
-    else:
-        return jsonify({"error": "Arquivo não encontrado no disco"}), 503
-
-    # Need at least 5 % for ffprobe to read the container header
-    for _ in range(60):
-        if handle.status().progress >= 0.05:
-            break
-        time.sleep(2)
-
-    tracks = get_track_info(file_path)
-    s      = handle.status()
-    result = {
-        "info_hash":    info_hash,
-        "name":         s.name,
-        "file_path":    file_path,
-        "file_size":    entry["file_size"],
-        "file_size_mb": round(entry["file_size"] / 1024 / 1024, 1),
-        "content_type": entry["content_type"],
-        "extension":    os.path.splitext(file_path)[1].lower(),
-        "stream_url":   f"/stream/{info_hash}",
-        "progress":     round(s.progress * 100, 1),
-        **tracks,
-    }
-
-    with active_streams_lock:
-        active_streams[info_hash]["track_info"] = result
-
-    return jsonify(result)
-
-
+# ── /status ───────────────────────────────────────────────────────────────────
 @app.route("/status")
 def status():
     result = []
@@ -603,7 +854,6 @@ def status():
             "peers":              s.num_peers,
             "state":              str(s.state),
             "stream_url":         f"/stream/{ih}" if ih in active_streams else None,
-            "info_url":           f"/info/{ih}"   if ih in active_streams else None,
             "has_track_info":     bool(entry.get("track_info")),
         })
     return jsonify({
@@ -614,6 +864,7 @@ def status():
     })
 
 
+# ── /stop ─────────────────────────────────────────────────────────────────────
 @app.route("/stop", methods=["POST"])
 def stop_torrent():
     data      = request.get_json(silent=True) or {}
@@ -640,264 +891,23 @@ def stop_torrent():
     return jsonify({"error": "Torrent não encontrado"}), 404
 
 
-# ── ID RESOLVERS ─────────────────────────────────────────────────────────────
-
-def resolve_kitsu_id(anime_name: str) -> str | None:
-    """
-    Busca o ID do Kitsu pelo nome do anime usando a API pública do Kitsu.
-    Retorna o ID (ex: "12189") ou None se não encontrar.
-    """
+# ── /play (legado) ────────────────────────────────────────────────────────────
+@app.route("/play")
+def play():
+    magnet = request.args.get("magnet", "").strip()
+    if not magnet:
+        return jsonify({"error": "magnet é obrigatório"}), 400
     try:
-        r = http_requests.get(
-            "https://kitsu.io/api/edge/anime",
-            params={"filter[text]": anime_name, "page[limit]": 1},
-            headers={"Accept": "application/vnd.api+json"},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            if data:
-                return data[0]["id"]
-    except Exception as e:
-        print(f"Kitsu resolve error: {e}")
-    return None
-
-
-def resolve_imdb_id(anime_name: str) -> str | None:
-    """
-    Busca o IMDB ID via CINEMETA (catálogo público do Stremio).
-    Retorna o tt-id (ex: "tt0388629") ou None.
-    """
-    try:
-        # Cinemeta search endpoint
-        r = http_requests.get(
-            f"https://v3-cinemeta.strem.io/catalog/series/top/search={http_requests.utils.quote(anime_name)}.json",
-            timeout=8,
-        )
-        if r.status_code == 200:
-            metas = r.json().get("metas", [])
-            if metas:
-                return metas[0].get("id")
-    except Exception as e:
-        print(f"Cinemeta resolve error: {e}")
-    return None
-
-
-def build_series_id(media_id: str, season: int, episode: int) -> str:
-    """
-    Monta o ID no formato esperado pelos addons Stremio para series/anime.
-    - IMDB:  tt0388629:1:1
-    - Kitsu: kitsu:12189:1
-    """
-    if media_id.startswith("tt"):
-        return f"{media_id}:{season}:{episode}"
-    else:
-        # Kitsu usa season implícita, somente episódio global ou S:E
-        return f"kitsu:{media_id}:{season}:{episode}"
-
-
-# ── STREMIO ADDON ROUTES ──────────────────────────────────────────────────────
-
-@app.route("/addons/search")
-def addon_search():
-    name     = request.args.get("name", "").strip()
-    season   = request.args.get("season", "1")
-    episode  = request.args.get("episode", "1")
-    imdb_id  = request.args.get("imdb_id", "").strip()
-    kitsu_id = request.args.get("kitsu_id", "").strip()
-
-    # 1. Validação e Resolução de ID
-    if not imdb_id or imdb_id == "null":
-        if name:
-            print(f"🔍 Resolvendo ID para: {name}")
-            imdb_id = resolve_imdb_id(name)
-        else:
-            return jsonify({"error": "Nome ou IMDB_ID necessário"}), 400
-
-    if not imdb_id:
-        return jsonify({"total": 0, "streams": [], "error": "Não foi possível localizar o ID do anime"})
-
-    # 2. Lógica de Fallback (Busca Generosa)
-    # Tentamos o ID literal e também a Season 1 (onde muitos animes ficam guardados)
-    ids_to_try = [f"{imdb_id}:{season}:{episode}"]
-    if int(season) > 1:
-        ids_to_try.append(f"{imdb_id}:1:{episode}")
-    
-    if kitsu_id:
-        ids_to_try.append(f"kitsu:{kitsu_id}:1:{episode}")
-
-    # 3. Busca em massa
-    all_raw_streams = []
-    for mid in ids_to_try:
-        # A função get_all_addon_streams agora usa os novos HEADERS internamente
-        batch = get_all_addon_streams("series", mid)
-        all_raw_streams.extend(batch)
-
-    # 4. Extração de Dados e Deduplicação (O que o seu front precisa)
-    import re
-    seen, streams_out = set(), []
-    
-    for s in all_raw_streams:
-        ih = s.get("infoHash")
-        if ih and ih not in seen:
-            seen.add(ih)
-            title = s.get("title", "")
-            
-            # Extração de qualidade (Regex do seu código antigo)
-            q_match = re.search(r"(4K|2160p|1080p|720p|480p)", title, re.IGNORECASE)
-            quality = q_match.group(1).upper() if q_match else "SD"
-            
-            # Extração de tamanho
-            s_match = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", title, re.IGNORECASE)
-            size = s_match.group(1) if s_match else ""
-
-            streams_out.append({
-                "title": title,
-                "infoHash": ih,
-                "magnet": f"magnet:?xt=urn:btih:{ih}",
-                "source": s.get("_source", "Unknown"),
-                "quality": quality,
-                "size": size,
-                "fileIdx": s.get("fileIdx")
-            })
-
-    # 5. Ordenação (Melhor qualidade primeiro)
-    q_map = {"4K": 0, "2160P": 0, "1080P": 1, "720P": 2, "480P": 3, "SD": 4}
-    streams_out.sort(key=lambda x: q_map.get(x["quality"], 5))
-
-    return jsonify({
-        "total": len(streams_out),
-        "streams": streams_out,
-        "meta": {
-            "name": name,
-            "imdb_id": imdb_id,
-            "season": season,
-            "episode": episode
-        }
-    })
-    
-@app.route("/addons/streams")
-def addon_streams():
-    """
-    Queries all configured Stremio addons in parallel.
-    ?type=movie|series  &id=tt1234567
-    Returns deduplicated stream list with magnet links.
-    """
-    media_type = request.args.get("type", "movie")
-    media_id   = request.args.get("id", "").strip()
-    if not media_id:
-        return jsonify({"error": "id é obrigatório"}), 400
-
-    streams = get_all_addon_streams(media_type, media_id)
-    return jsonify({
-        "streams": [
-            {
-                "title":    s.get("title"),
-                "infoHash": s.get("infoHash"),
-                "magnet":   f"magnet:?xt=urn:btih:{s['infoHash']}" if s.get("infoHash") else None,
-                "source":   s.get("_source"),
-                "fileIdx":  s.get("fileIdx"),
-            }
-            for s in streams
-        ]
-    })
-
-
-@app.route("/addons/start", methods=["POST"])
-def addon_start():
-    """
-    Endpoint principal de reprodução — recebe a escolha do usuário e devolve
-    tudo que o player precisa em um único JSON.
-
-    Body JSON:
-      {
-        "infoHash": "abc123...",          -- obrigatório
-        "magnet":   "magnet:?xt=...",     -- opcional (infoHash já é suficiente)
-        "title":    "One Piece S01E01"    -- opcional, para exibição
-      }
-
-    Resposta (JSON):
-      {
-        "info_hash":   "abc123...",
-        "stream_url":  "http://localhost:5000/stream/abc123",
-        "name":        "One Piece - Episode 1.mkv",
-        "file_size_mb": 700.4,
-        "extension":   ".mkv",
-        "content_type": "video/x-matroska",
-        "progress":    5.2,
-        "audio_tracks": [
-          { "index": 0, "language": "jpn", "title": "Japanese", "codec": "AAC",
-            "channels": 2, "channel_label": "Stereo", "is_default": true, "is_forced": false }
-        ],
-        "subtitle_tracks": [
-          { "index": 1, "language": "por", "title": "Português", "codec": "ASS",
-            "is_default": false, "is_forced": false, "is_hearing_impaired": false }
-        ],
-        "ffprobe_available": true
-      }
-
-    O React só precisa:
-      1. Chamar POST /addons/start com o stream escolhido
-      2. Usar stream_url direto no <video src>
-      3. Exibir audio_tracks e subtitle_tracks para o usuário escolher
-      4. Chamar GET /status para polling de progresso (opcional)
-      5. Chamar POST /stop com info_hash ao sair
-    """
-    data     = request.get_json(silent=True) or {}
-    ih       = data.get("infoHash", "").strip().lower()
-    magnet   = data.get("magnet", "").strip()
-    title    = data.get("title", "")
-
-    if not ih and not magnet:
-        return jsonify({"error": "Forneça 'infoHash' ou 'magnet'"}), 400
-
-    # Monta magnet se só tiver hash
-    if not magnet and ih:
-        magnet = f"magnet:?xt=urn:btih:{ih}"
-
-    # ── 1. Bootstrap: metadata + prioridade de arquivo ────────────────────────
-    try:
-        handle, info_hash, file_path, file_size, content_type = bootstrap_magnet(magnet)
+        handle, _, file_path, file_size, content_type = bootstrap_magnet(magnet)
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 504
 
-    print(f"▶ Start: {title or info_hash}")
-
-    # ── 2. Aguarda buffer mínimo (~5%) para ffprobe funcionar ──────────────────
     for _ in range(120):
         if handle.status().progress > 0.05:
             break
         time.sleep(1)
 
-    # ── 3. Aguarda arquivo existir no disco ────────────────────────────────────
-    for _ in range(30):
-        if os.path.exists(file_path):
-            break
-        time.sleep(1)
-
-    # ── 4. Analisa trilhas via ffprobe ─────────────────────────────────────────
-    tracks = get_track_info(file_path)
-
-    # ── 5. Monta resposta completa ─────────────────────────────────────────────
-    s = handle.status()
-    response = {
-        "info_hash":        info_hash,
-        "stream_url":       f"http://localhost:5000/stream/{info_hash}",
-        "name":             s.name,
-        "title":            title,
-        "file_size_mb":     round(file_size / 1024 / 1024, 1),
-        "extension":        os.path.splitext(file_path)[1].lower(),
-        "content_type":     content_type,
-        "progress":         round(s.progress * 100, 1),
-        **tracks,
-    }
-
-    # Cacheia no active_streams
-    with active_streams_lock:
-        if info_hash in active_streams:
-            active_streams[info_hash]["track_info"] = response
-
-    return jsonify(response)
+    return stream_file_response(file_path, file_size, content_type)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -926,4 +936,4 @@ if __name__ == "__main__":
 
     stop_event.wait()
     cleanup_all()
-    sys.exit(0)
+    sys.exit(0) 

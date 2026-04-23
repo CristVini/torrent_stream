@@ -30,13 +30,16 @@ jobs:
             flask `
             flask-cors `
             requests `
+            nyaapy `
+            beautifulsoup4 `
             pystray `
             pillow `
             nuitka `
             ordered-set `
             zstandard
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
-          python -c "import requests; print('requests OK:', requests.__version__)"
+          python -c "import requests;   print('requests   OK:', requests.__version__)"
+          python -c "import nyaapy;     print('nyaapy     OK')"
 
       - name: Compilar com Nuitka
         run: |
@@ -60,17 +63,18 @@ jobs:
             "--include-package=itsdangerous",
             "--include-package=markupsafe",
 
-            # HTTP client
+            # HTTP + scraping
             "--include-package=requests",
             "--include-package=urllib3",
             "--include-package=certifi",
             "--include-package=charset_normalizer",
             "--include-package=idna",
+            "--include-package=bs4",
+            "--include-package=nyaapy",
 
             # libtorrent native extension
             "--include-data-files=$lt_file=libtorrent.pyd",
 
-            # Keep console for debug (change to disable to hide it)
             "--windows-console-mode=attach"
           )
 
