@@ -378,35 +378,60 @@ def bootstrap_magnet(magnet: str):
 
 # ── STREMIO ADDON ENGINE ─────────────────────────────────────────────────────
 def _fetch_addon_streams(addon_url, media_type, media_id):
+    # 1. Limpeza rigorosa da URL base
+    base_url = addon_url.replace("/manifest.json", "").rstrip("/")
+    target_url = f"{base_url}/stream/{media_type}/{media_id}.json"
+    
+    # 2. Headers idênticos ao teste (O SEGREDO DO SUCESSO)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://web.stremio.com/"
+    }
+
     try:
-        r = http_requests.get(
-            f"{addon_url}/stream/{media_type}/{media_id}.json",
-            timeout=10,
-        )
+        # Usamos http_requests ou requests normal, dependendo de como importou
+        r = http_requests.get(target_url, headers=headers, timeout=12)
+        
         if r.status_code == 200:
-            streams = r.json().get("streams", [])
-            for s in streams:
-                s["_source"] = addon_url
-            return streams
-    except Exception:
-        pass
+            # Tratamento de JSON seguro para evitar o erro "line 1 column 1"
+            try:
+                data = r.json()
+                streams = data.get("streams", [])
+                for s in streams:
+                    s["_source"] = addon_url
+                return streams
+            except ValueError:
+                print(f"❌ Erro de decodificação JSON em {addon_url}")
+                return []
+        else:
+            print(f"⚠️ Addon {addon_url} retornou status {r.status_code}")
+            
+    except Exception as e:
+        print(f"❗ Falha de conexão com {addon_url}: {e}")
+    
     return []
 
 def get_all_addon_streams(media_type, media_id):
     all_streams = []
+    # Usar a lista global de addons que você definiu (Torrentio, Comet, etc)
     with ThreadPoolExecutor(max_workers=len(STREMIO_ADDONS)) as ex:
-        for batch in ex.map(
-            lambda a: _fetch_addon_streams(a, media_type, media_id),
-            STREMIO_ADDONS,
-        ):
-            all_streams.extend(batch)
+        # O map vai rodar o _fetch_addon_streams para cada addon
+        results = ex.map(lambda a: _fetch_addon_streams(a, media_type, media_id), STREMIO_ADDONS)
+        
+        for batch in results:
+            if batch: # Só adiciona se houver resultados
+                all_streams.extend(batch)
 
+    # Lógica de remoção de duplicatas por infoHash
     seen, unique = set(), []
     for s in all_streams:
         ih = s.get("infoHash")
         if ih and ih not in seen:
             seen.add(ih)
             unique.append(s)
+    
+    print(f"📦 Total de streams encontrados: {len(unique)}")
     return unique
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
@@ -616,111 +641,80 @@ def build_series_id(media_id: str, season: int, episode: int) -> str:
 
 @app.route("/addons/search")
 def addon_search():
-    """
-    Busca generosa: consulta a temporada pedida e a 'Season 1' como fallback,
-    permitindo que o Frontend filtre os resultados reais pelo título.
-    """
     name     = request.args.get("name", "").strip()
-    season   = int(request.args.get("season", 1))
-    episode  = int(request.args.get("episode", 1))
+    season   = request.args.get("season", "1")
+    episode  = request.args.get("episode", "1")
     imdb_id  = request.args.get("imdb_id", "").strip()
     kitsu_id = request.args.get("kitsu_id", "").strip()
 
-    if not name and not imdb_id and not kitsu_id:
-        return jsonify({"error": "Forneça 'name', 'imdb_id' ou 'kitsu_id'"}), 400
+    # 1. Validação e Resolução de ID
+    if not imdb_id or imdb_id == "null":
+        if name:
+            print(f"🔍 Resolvendo ID para: {name}")
+            imdb_id = resolve_imdb_id(name)
+        else:
+            return jsonify({"error": "Nome ou IMDB_ID necessário"}), 400
 
-    resolved = {"name": name, "imdb_id": imdb_id, "kitsu_id": kitsu_id}
+    if not imdb_id:
+        return jsonify({"total": 0, "streams": [], "error": "Não foi possível localizar o ID do anime"})
 
-    # 1. Resolve IDs se não fornecidos
-    if name and not kitsu_id:
-        kitsu_id = resolve_kitsu_id(name)
-        resolved["kitsu_id"] = kitsu_id
-
-    if name and not imdb_id:
-        imdb_id = resolve_imdb_id(name)
-        resolved["imdb_id"] = imdb_id
-
-    # 2. Monta lista de IDs para busca simultânea (Melhoria de Fallback para Animes)
-    ids_to_try = []
+    # 2. Lógica de Fallback (Busca Generosa)
+    # Tentamos o ID literal e também a Season 1 (onde muitos animes ficam guardados)
+    ids_to_try = [f"{imdb_id}:{season}:{episode}"]
+    if int(season) > 1:
+        ids_to_try.append(f"{imdb_id}:1:{episode}")
     
-    if imdb_id:
-        # Tenta a temporada literal solicitada
-        ids_to_try.append(("series", f"{imdb_id}:{season}:{episode}"))
-        # Fallback para animes que usam numeração absoluta na S01
-        if season > 1:
-            ids_to_try.append(("series", f"{imdb_id}:1:{episode}"))
-
     if kitsu_id:
-        # No Kitsu, novas temporadas geralmente registram conteúdo como Season 1 do novo ID
-        ids_to_try.append(("series", f"kitsu:{kitsu_id}:1:{episode}"))
-        # Tenta também a temporada literal por segurança
-        if season > 1:
-            ids_to_try.append(("series", f"kitsu:{kitsu_id}:{season}:{episode}"))
+        ids_to_try.append(f"kitsu:{kitsu_id}:1:{episode}")
 
-    if not ids_to_try:
-        return jsonify({
-            "error": "Não foi possível resolver IDs para este anime",
-            "resolved": resolved,
-        }), 404
+    # 3. Busca em massa
+    all_raw_streams = []
+    for mid in ids_to_try:
+        # A função get_all_addon_streams agora usa os novos HEADERS internamente
+        batch = get_all_addon_streams("series", mid)
+        all_raw_streams.extend(batch)
 
-    # 3. Busca em todos os addons em paralelo
-    all_streams = []
-    tasks = [(addon, mtype, mid) for addon in STREMIO_ADDONS for mtype, mid in ids_to_try]
-
-    with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
-        futures = {ex.submit(_fetch_addon_streams, addon, mtype, mid): (addon, mid)
-                   for addon, mtype, mid in tasks}
-        for future in futures:
-            try:
-                result_streams = future.result()
-                if result_streams:
-                    all_streams.extend(result_streams)
-            except Exception:
-                pass
-
-    # 4. Deduplicação e Processamento de Títulos
-    seen, unique = set(), []
-    for s in all_streams:
+    # 4. Extração de Dados e Deduplicação (O que o seu front precisa)
+    import re
+    seen, streams_out = set(), []
+    
+    for s in all_raw_streams:
         ih = s.get("infoHash")
         if ih and ih not in seen:
             seen.add(ih)
-            unique.append(s)
+            title = s.get("title", "")
+            
+            # Extração de qualidade (Regex do seu código antigo)
+            q_match = re.search(r"(4K|2160p|1080p|720p|480p)", title, re.IGNORECASE)
+            quality = q_match.group(1).upper() if q_match else "SD"
+            
+            # Extração de tamanho
+            s_match = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", title, re.IGNORECASE)
+            size = s_match.group(1) if s_match else ""
 
-    import re
-    def extract_quality(title: str) -> str:
-        if not title: return ""
-        m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", title, re.IGNORECASE)
-        return m.group(1).upper() if m else ""
+            streams_out.append({
+                "title": title,
+                "infoHash": ih,
+                "magnet": f"magnet:?xt=urn:btih:{ih}",
+                "source": s.get("_source", "Unknown"),
+                "quality": quality,
+                "size": size,
+                "fileIdx": s.get("fileIdx")
+            })
 
-    def extract_size(title: str) -> str:
-        if not title: return ""
-        m = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", title, re.IGNORECASE)
-        return m.group(1) if m else ""
-
-    # 5. Formata a saída para o Frontend
-    streams_out = []
-    for s in unique:
-        title = s.get("title", "") or ""
-        streams_out.append({
-            "title":    title,
-            "infoHash": s.get("infoHash"),
-            "magnet":   f"magnet:?xt=urn:btih:{s['infoHash']}" if s.get("infoHash") else None,
-            "source":   s.get("_source", ""),
-            "fileIdx":  s.get("fileIdx"),
-            "quality":  extract_quality(title),
-            "size":     extract_size(title),
-        })
-
-    # Ordenação por qualidade (1080p primeiro, depois 720p...)
-    quality_order = {"1080P": 0, "720P": 1, "4K": 2, "2160P": 2, "480P": 3, "360P": 4, "": 5}
-    streams_out.sort(key=lambda s: quality_order.get(s["quality"].upper(), 5))
+    # 5. Ordenação (Melhor qualidade primeiro)
+    q_map = {"4K": 0, "2160P": 0, "1080P": 1, "720P": 2, "480P": 3, "SD": 4}
+    streams_out.sort(key=lambda x: q_map.get(x["quality"], 5))
 
     return jsonify({
-        "resolved": resolved,
-        "season":   season,
-        "episode":  episode,
-        "total":    len(streams_out),
-        "streams":  streams_out,
+        "total": len(streams_out),
+        "streams": streams_out,
+        "meta": {
+            "name": name,
+            "imdb_id": imdb_id,
+            "season": season,
+            "episode": episode
+        }
     })
     
 @app.route("/addons/streams")
