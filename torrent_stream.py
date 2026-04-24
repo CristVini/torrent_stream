@@ -51,6 +51,23 @@ NYAA_CAT_ANIME      = 1   # Anime (all)
 NYAA_CAT_ANIME_EN   = 12  # Anime - English-translated
 NYAA_CAT_ANIME_RAW  = 14  # Anime - Raw (for DUB detection)
 
+# ── TRANSCODE CONFIG ────────────────────────────────────────────────────────
+# Codecs de áudio que o browser NÃO suporta nativamente → precisam de transcode
+AUDIO_TRANSCODE_CODECS = {
+    "eac3", "ac3", "dts", "truehd", "mlp", "flac",
+    "dts-hd", "dts-x", "dolby_atmos", "thd",
+}
+
+# HLS: tamanho de cada segmento em segundos
+HLS_SEGMENT_SECS = 6
+
+# Pasta de cache de transcode (subpasta de DOWNLOAD_PATH, criada no start)
+HLS_CACHE_PATH = ""
+
+# GPU encoder detectado (preenchido na primeira chamada)
+_gpu_encoder: Optional[str] = None
+_gpu_lock = threading.Lock()
+
 # ── FLASK + SESSION ─────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
@@ -627,6 +644,297 @@ def search_all_sources(
     print(f"📦 Total final: {len(sorted_streams)} streams únicos")
     return sorted_streams
 
+
+# ── GPU DETECTION ────────────────────────────────────────────────────────────
+def detect_gpu_encoder() -> str:
+    """
+    Testa NVENC (NVIDIA) e QSV (Intel) em ordem.
+    Retorna o encoder disponível ou "libx264" (CPU) como fallback.
+    Resultado é cacheado em _gpu_encoder.
+    """
+    global _gpu_encoder
+    with _gpu_lock:
+        if _gpu_encoder is not None:
+            return _gpu_encoder
+
+        test_cmd_base = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "nullsrc=s=64x64:d=1",
+        ]
+
+        for encoder, label in [("h264_nvenc", "NVIDIA NVENC"), ("h264_qsv", "Intel QSV")]:
+            try:
+                proc = subprocess.run(
+                    test_cmd_base + ["-c:v", encoder, "-f", "null", "-"],
+                    capture_output=True, timeout=8,
+                )
+                if proc.returncode == 0:
+                    print(f"✅ GPU encoder: {label} ({encoder})")
+                    _gpu_encoder = encoder
+                    return _gpu_encoder
+            except Exception:
+                pass
+
+        print("⚠ GPU não detectada — usando libx264 (CPU)")
+        _gpu_encoder = "libx264"
+        return _gpu_encoder
+
+
+# ── HLS TRANSCODE ENGINE ──────────────────────────────────────────────────────
+def _hls_cache_dir(info_hash: str, mode: str) -> str:
+    """Retorna (e cria) o diretório de cache HLS para um dado hash e modo."""
+    d = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _is_hls_ready(cache_dir: str) -> bool:
+    """Verifica se já existe um .m3u8 válido no cache."""
+    m3u8 = os.path.join(cache_dir, "index.m3u8")
+    return os.path.exists(m3u8) and os.path.getsize(m3u8) > 0
+
+
+def _probe_first_audio_codec(file_path: str) -> str:
+    """Retorna o codec_name da primeira trilha de áudio (lower). Ex: 'eac3', 'aac'."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "a:0", file_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        streams = json.loads(proc.stdout).get("streams", [])
+        if streams:
+            return streams[0].get("codec_name", "").lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _probe_first_video_codec(file_path: str) -> str:
+    """Retorna o codec_name da primeira trilha de vídeo (lower). Ex: 'hevc', 'h264'."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0", file_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        streams = json.loads(proc.stdout).get("streams", [])
+        if streams:
+            return streams[0].get("codec_name", "").lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _needs_audio_transcode(file_path: str) -> bool:
+    codec = _probe_first_audio_codec(file_path)
+    return codec in AUDIO_TRANSCODE_CODECS
+
+
+def _needs_video_transcode(file_path: str) -> bool:
+    codec = _probe_first_video_codec(file_path)
+    # HEVC/H.265, AV1, VP9 não são suportados em todos os browsers
+    return codec in {"hevc", "av1", "vp9", "mpeg2video", "mpeg4"}
+
+
+def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
+    """
+    Inicia o FFmpeg em background para transcodificar o arquivo em HLS.
+
+    Modos:
+      "audio"  — vídeo em copy, áudio → AAC 2.0 192k  (leve, resolve DDP/DTS)
+      "full"   — vídeo → H.264 (GPU ou CPU), áudio → AAC 2.0 192k  (pesado)
+      "copy"   — vídeo e áudio em copy, apenas remux para HLS/TS  (ultra-leve)
+
+    Retorna o caminho do arquivo .m3u8 gerado.
+    """
+    cache_dir = _hls_cache_dir(info_hash, mode)
+    m3u8_path = os.path.join(cache_dir, "index.m3u8")
+
+    # Se já existe cache válido, retorna imediatamente
+    if _is_hls_ready(cache_dir):
+        print(f"♻ HLS cache hit: {cache_dir}")
+        return m3u8_path
+
+    encoder = detect_gpu_encoder()
+
+    # ── Parâmetros de vídeo ──────────────────────────────────────────────────
+    if mode == "copy" or mode == "audio":
+        video_args = ["-c:v", "copy"]
+    else:
+        # full transcode: H.264 via GPU ou CPU
+        if encoder == "h264_nvenc":
+            video_args = [
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",          # balanced speed/quality
+                "-rc", "vbr",
+                "-cq", "23",
+                "-b:v", "0",
+                "-profile:v", "high",
+            ]
+        elif encoder == "h264_qsv":
+            video_args = [
+                "-c:v", "h264_qsv",
+                "-global_quality", "23",
+                "-look_ahead", "1",
+                "-profile:v", "high",
+            ]
+        else:
+            # CPU libx264 — mais lento mas universal
+            video_args = [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-profile:v", "high",
+                "-level", "4.1",
+            ]
+
+    # ── Parâmetros de áudio ──────────────────────────────────────────────────
+    # Detecta codec atual — se já for AAC e modo != full, copia sem recodificar
+    audio_codec = _probe_first_audio_codec(file_path)
+    if mode == "copy":
+        audio_args = ["-c:a", "copy"]
+    elif audio_codec == "aac" and mode == "audio":
+        audio_args = ["-c:a", "copy"]
+    else:
+        # DDP (EAC3) / DTS / AC3 / TrueHD → AAC Stereo 192k
+        # -ac 2 garante downmix para stereo (compatível com todos os browsers)
+        audio_args = [
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ac", "2",          # stereo downmix — elimina DDP 5.1 incompatível
+            "-ar", "48000",
+        ]
+
+    # ── Monta comando FFmpeg completo ────────────────────────────────────────
+    segment_path = os.path.join(cache_dir, "seg%05d.ts")
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-i", file_path,
+        *video_args,
+        *audio_args,
+        "-sn",                            # sem legenda no stream (servida separado)
+        "-f", "hls",
+        "-hls_time", str(HLS_SEGMENT_SECS),
+        "-hls_list_size", "0",            # mantém todos os segmentos no m3u8
+        "-hls_flags", "independent_segments+append_list",
+        "-hls_segment_type", "mpegts",
+        "-hls_segment_filename", segment_path,
+        "-start_number", "0",
+        m3u8_path,
+    ]
+
+    print(f"🎬 FFmpeg HLS [{mode}] → {cache_dir}")
+    print(f"   encoder={encoder}  audio={audio_codec}→{'aac' if mode != 'copy' else 'copy'}")
+
+    # Roda em background — Flask serve os segmentos conforme são criados
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+    # Registra o processo para poder matar depois
+    with active_streams_lock:
+        if info_hash in active_streams:
+            active_streams[info_hash].setdefault("ffmpeg_procs", []).append(proc)
+
+    # Thread que lê stderr e imprime warnings relevantes
+    def _log_ffmpeg(p, label):
+        for line in p.stderr:
+            decoded = line.decode(errors="replace").strip()
+            if decoded and "frame=" not in decoded:
+                print(f"[ffmpeg/{label}] {decoded}")
+
+    threading.Thread(target=_log_ffmpeg, args=(proc, mode[:4]), daemon=True).start()
+
+    # Aguarda o primeiro segmento aparecer (até 30s)
+    seg0 = os.path.join(cache_dir, "seg00000.ts")
+    for _ in range(60):
+        if os.path.exists(seg0) and os.path.getsize(seg0) > 0:
+            break
+        time.sleep(0.5)
+    else:
+        proc.kill()
+        raise RuntimeError("FFmpeg não gerou o primeiro segmento HLS em 30s")
+
+    return m3u8_path
+
+
+def extract_subtitle_vtt(info_hash: str, file_path: str, stream_index: int = 0) -> Optional[str]:
+    """
+    Extrai uma trilha de legenda do MKV e converte para WebVTT.
+    Retorna o caminho do .vtt gerado ou None se falhar.
+
+    stream_index: índice da trilha de legenda (0 = primeira)
+    """
+    cache_dir = _hls_cache_dir(info_hash, "subs")
+    vtt_path  = os.path.join(cache_dir, f"sub_{stream_index}.vtt")
+
+    if os.path.exists(vtt_path) and os.path.getsize(vtt_path) > 0:
+        return vtt_path
+
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", file_path,
+            "-map", f"0:s:{stream_index}",   # seleciona trilha de legenda
+            "-c:s", "webvtt",                  # converte para WebVTT
+            "-f", "webvtt",
+            vtt_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+        if proc.returncode == 0 and os.path.exists(vtt_path):
+            print(f"💬 Legenda VTT extraída: {vtt_path}")
+            return vtt_path
+        else:
+            err = proc.stderr.decode(errors="replace")
+            print(f"⚠ Falha ao extrair legenda {stream_index}: {err[:200]}")
+    except Exception as e:
+        print(f"❗ extract_subtitle_vtt error: {e}")
+
+    return None
+
+
+def kill_ffmpeg_procs(info_hash: str) -> None:
+    """Para todos os processos FFmpeg associados a um info_hash."""
+    with active_streams_lock:
+        entry = active_streams.get(info_hash, {})
+        procs = entry.get("ffmpeg_procs", [])
+
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    with active_streams_lock:
+        if info_hash in active_streams:
+            active_streams[info_hash]["ffmpeg_procs"] = []
+
+
+# ── AUTO-MODE: escolhe o modo de transcode mais leve necessário ───────────────
+def auto_transcode_mode(file_path: str) -> str:
+    """
+    Determina automaticamente o modo de transcode necessário:
+      - "copy"  → áudio e vídeo já compatíveis com browser
+      - "audio" → só o áudio precisa ser convertido (DDP/DTS → AAC)
+      - "full"  → vídeo HEVC/AV1 + áudio incompatível
+    """
+    needs_v = _needs_video_transcode(file_path)
+    needs_a = _needs_audio_transcode(file_path)
+
+    if needs_v:
+        return "full"
+    if needs_a:
+        return "audio"
+    return "copy"
+
+
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 
 @app.route("/ping")
@@ -797,9 +1105,16 @@ def addon_start():
     tracks = get_track_info(file_path)
 
     s = handle.status()
+
+    # Detecta automaticamente o modo de transcode necessário
+    transcode_mode = auto_transcode_mode(file_path)
+    print(f"🔧 Transcode mode: {transcode_mode}")
+
     resp = {
         "info_hash":        info_hash,
         "stream_url":       f"http://localhost:5000/stream/{info_hash}",
+        "hls_url":          f"http://localhost:5000/hls/{info_hash}/index.m3u8",
+        "transcode_mode":   transcode_mode,   # "copy" | "audio" | "full"
         "name":             s.name,
         "title":            title,
         "file_size_mb":     round(file_size / 1024 / 1024, 1),
@@ -820,8 +1135,8 @@ def addon_start():
 @app.route("/stream/<info_hash>")
 def stream_by_hash(info_hash):
     """
-    Range-ready stream. Use diretamente como <video src>.
-    Suporta seeking em MKV via HTTP 206 Partial Content.
+    Range-ready stream direto do arquivo (sem transcode).
+    Use quando o browser já suporta o codec (H.264 + AAC).
     """
     info_hash = info_hash.lower()
     with active_streams_lock:
@@ -831,6 +1146,179 @@ def stream_by_hash(info_hash):
     if not os.path.exists(entry["file_path"]):
         return jsonify({"error": "Arquivo ainda não disponível"}), 503
     return stream_file_response(entry["file_path"], entry["file_size"], entry["content_type"])
+
+
+# ── /hls/<hash>/index.m3u8 + segmentos ───────────────────────────────────────
+@app.route("/hls/<info_hash>/index.m3u8")
+def hls_playlist(info_hash):
+    """
+    Inicia (ou retorna do cache) o HLS transcoding e serve o .m3u8.
+
+    Query params:
+      ?mode=auto   (padrão) — detecta automaticamente o modo necessário
+      ?mode=audio  — converte só o áudio (DDP/DTS → AAC), vídeo em copy
+      ?mode=full   — converte vídeo (HEVC→H.264) + áudio
+      ?mode=copy   — remux puro, sem recodificar nada
+
+    O React deve usar esta URL no <video src> quando transcode_mode != "copy"
+    ou quando o arquivo tiver codec incompatível.
+    """
+    info_hash = info_hash.lower()
+    mode      = request.args.get("mode", "auto").lower()
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash)
+    if not entry:
+        return jsonify({"error": "Stream não encontrado"}), 404
+
+    file_path = entry["file_path"]
+    if not os.path.exists(file_path):
+        return jsonify({"error": "Arquivo ainda não disponível"}), 503
+
+    # Resolve modo automático
+    if mode == "auto":
+        mode = auto_transcode_mode(file_path)
+
+    try:
+        m3u8_path = start_hls_transcode(info_hash, file_path, mode)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Serve o .m3u8 com CORS
+    with open(m3u8_path, "r") as f:
+        m3u8_content = f.read()
+
+    # Reescreve URLs dos segmentos para apontar para nossa rota
+    # (FFmpeg gera caminhos locais; precisamos expor via HTTP)
+    m3u8_content = re.sub(
+        r"(seg\d+\.ts)",
+        lambda m: f"/hls/{info_hash}/{m.group(1)}",
+        m3u8_content,
+    )
+
+    return Response(
+        m3u8_content,
+        mimetype="application/vnd.apple.mpegurl",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+@app.route("/hls/<info_hash>/<segment>")
+def hls_segment(info_hash, segment):
+    """
+    Serve um segmento .ts do HLS.
+    O browser/player requisita automaticamente conforme avança no vídeo.
+    """
+    info_hash = info_hash.lower()
+
+    # Valida nome do segmento (apenas letras, números, underscore, ponto)
+    if not re.match(r"^seg\d+\.ts$", segment):
+        return jsonify({"error": "Segmento inválido"}), 400
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash)
+    if not entry:
+        return jsonify({"error": "Stream não encontrado"}), 404
+
+    # Procura o segmento em qualquer subpasta de cache deste hash
+    cache_base = os.path.join(HLS_CACHE_PATH, "")
+    seg_path   = None
+    for mode in ("audio", "full", "copy"):
+        candidate = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}", segment)
+        if os.path.exists(candidate):
+            seg_path = candidate
+            break
+
+    if not seg_path:
+        # Segmento ainda sendo gerado — aguarda até 10s
+        for _ in range(20):
+            for mode in ("audio", "full", "copy"):
+                candidate = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}", segment)
+                if os.path.exists(candidate):
+                    seg_path = candidate
+                    break
+            if seg_path:
+                break
+            time.sleep(0.5)
+
+    if not seg_path:
+        return jsonify({"error": "Segmento não disponível"}), 503
+
+    file_size = os.path.getsize(seg_path)
+    return stream_file_response(seg_path, file_size, "video/mp2t")
+
+
+# ── /subtitles/<hash>/<index>.vtt ────────────────────────────────────────────
+@app.route("/subtitles/<info_hash>/<int:sub_index>.vtt")
+def serve_subtitle(info_hash, sub_index):
+    """
+    Extrai e serve uma trilha de legenda como WebVTT.
+
+    Uso no React:
+      <track kind="subtitles" src="http://localhost:5000/subtitles/{hash}/0.vtt" />
+
+    sub_index: índice da trilha de legenda (0 = primeira, 1 = segunda...)
+    """
+    info_hash = info_hash.lower()
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash)
+    if not entry:
+        return jsonify({"error": "Stream não encontrado"}), 404
+
+    file_path = entry["file_path"]
+    if not os.path.exists(file_path):
+        return jsonify({"error": "Arquivo ainda não disponível"}), 503
+
+    vtt_path = extract_subtitle_vtt(info_hash, file_path, sub_index)
+    if not vtt_path:
+        return jsonify({"error": f"Legenda {sub_index} não encontrada ou erro na extração"}), 404
+
+    with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
+        vtt_content = f.read()
+
+    return Response(
+        vtt_content,
+        mimetype="text/vtt",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "max-age=3600",
+        },
+    )
+
+
+# ── /transcode/status/<hash> ──────────────────────────────────────────────────
+@app.route("/transcode/status/<info_hash>")
+def transcode_status(info_hash):
+    """
+    Retorna quantos segmentos HLS já foram gerados e se o FFmpeg ainda está rodando.
+    O React pode usar para mostrar uma barra de progresso de transcode.
+    """
+    info_hash = info_hash.lower()
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash, {})
+        procs = entry.get("ffmpeg_procs", [])
+
+    running = any(p.poll() is None for p in procs)
+
+    # Conta segmentos em qualquer modo de cache
+    segments = 0
+    for mode in ("audio", "full", "copy"):
+        d = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}")
+        if os.path.isdir(d):
+            segments = len([f for f in os.listdir(d) if f.endswith(".ts")])
+            break
+
+    return jsonify({
+        "info_hash":   info_hash,
+        "running":     running,
+        "segments":    segments,
+        "seconds_ready": segments * HLS_SEGMENT_SECS,
+    })
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
@@ -876,6 +1364,7 @@ def stop_torrent():
         entry = active_streams.pop(info_hash, None)
 
     if entry:
+        kill_ffmpeg_procs(info_hash)
         threading.Thread(
             target=cleanup_torrent,
             args=(entry["handle"], entry["file_path"]),
@@ -918,7 +1407,13 @@ if __name__ == "__main__":
 
     DOWNLOAD_PATH = result["path"]
     IS_TEMPORARY  = result["temporary"]
+
+    # Cria pasta de cache de transcode HLS
+    HLS_CACHE_PATH = os.path.join(DOWNLOAD_PATH, ".hls_cache")
+    os.makedirs(HLS_CACHE_PATH, exist_ok=True)
+
     print(f"📁 {DOWNLOAD_PATH}  [{'temporário' if IS_TEMPORARY else 'permanente'}]")
+    print(f"🎬 HLS cache: {HLS_CACHE_PATH}")
     print("🚀 http://0.0.0.0:5000")
 
     stop_event = threading.Event()
@@ -936,4 +1431,4 @@ if __name__ == "__main__":
 
     stop_event.wait()
     cleanup_all()
-    sys.exit(0) 
+    sys.exit(0)

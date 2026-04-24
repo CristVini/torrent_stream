@@ -32,6 +32,7 @@ jobs:
             requests `
             nyaapy `
             beautifulsoup4 `
+            ffmpeg-python `
             pystray `
             pillow `
             nuitka `
