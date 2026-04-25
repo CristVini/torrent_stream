@@ -396,6 +396,25 @@ def bootstrap_magnet(magnet: str):
         }
 
     print(f"▶ {os.path.basename(file_path)}  ({file_size/1024/1024:.1f} MB)  [{content_type}]  hash={info_hash}")
+
+    # ── Fast-Start: prioriza primeiras peças (moov atom / header do container) ─
+    try:
+        piece_size    = ti.piece_length()
+        header_bytes  = min(5 * 1024 * 1024, file_size // 20)
+        header_pieces = max(1, header_bytes // piece_size)
+        tail_bytes    = min(1 * 1024 * 1024, file_size // 50)
+        tail_pieces   = max(1, tail_bytes // piece_size)
+        total_pieces  = ti.num_pieces()
+
+        for piece in range(min(header_pieces, total_pieces)):
+            handle.piece_priority(piece, 7)
+        for piece in range(max(0, total_pieces - tail_pieces), total_pieces):
+            handle.piece_priority(piece, 6)
+
+        print(f"⚡ Fast-start: {header_pieces} peças iniciais + {tail_pieces} finais priorizadas")
+    except Exception as e:
+        print(f"⚠ Fast-start priority: {e}")
+
     return handle, info_hash, file_path, file_size, content_type
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -699,9 +718,9 @@ class FFmpegError(RuntimeError):
 # ── GPU DETECTION ────────────────────────────────────────────────────────────
 def detect_gpu_encoder() -> str:
     """
-    Detecta NVENC (NVIDIA) ou QSV (Intel) testando com um frame nulo.
+    Testa NVENC (NVIDIA) e QSV (Intel) com capture_output=True.
+    capture_output é seguro no Windows — não sofre do WinError 6.
     Retorna 'h264_nvenc', 'h264_qsv' ou 'libx264' (CPU fallback).
-    Resultado fica cacheado para não rodar ffmpeg toda vez.
     """
     global _gpu_encoder
     with _gpu_lock:
@@ -714,16 +733,20 @@ def detect_gpu_encoder() -> str:
                     [
                         "ffmpeg", "-hide_banner", "-loglevel", "error",
                         "-f", "lavfi", "-i", "nullsrc=s=64x64:d=1",
-                        "-c:v", encoder, "-f", "null", "-",
+                        "-c:v", encoder, "-frames:v", "1", "-f", "null", "-",
                     ],
-                    capture_output=True, timeout=8,
+                    capture_output=True, timeout=10,
                 )
                 if proc.returncode == 0:
                     print(f"✅ GPU encoder: {label} ({encoder})")
                     _gpu_encoder = encoder
                     return _gpu_encoder
-            except Exception:
-                pass
+            except FileNotFoundError:
+                print("⚠ ffmpeg não encontrado no PATH")
+                _gpu_encoder = "libx264"
+                return _gpu_encoder
+            except Exception as e:
+                print(f"⚠ GPU test {encoder}: {e}")
 
         print("⚠ GPU não detectada — usando libx264 (CPU)")
         _gpu_encoder = "libx264"
@@ -947,20 +970,28 @@ def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
     stderr_lock  = threading.Lock()
 
     # Inicia processo em background
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-    )
+    # IMPORTANTE: No Windows, CREATE_NO_WINDOW + stderr=PIPE causa WinError 6
+    # (Identificador Inválido). A solução é usar STARTUPINFO para ocultar a janela
+    # sem fechar os handles de pipe.
+    _popen_kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+    }
+    if sys.platform == "win32":
+        _si = subprocess.STARTUPINFO()
+        _si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
+        _si.wShowWindow = 0   # SW_HIDE
+        _popen_kwargs["startupinfo"] = _si
+        # NÃO usar creationflags=CREATE_NO_WINDOW com PIPE — causa WinError 6
+
+    proc = subprocess.Popen(cmd, **_popen_kwargs)
 
     with active_streams_lock:
         if info_hash in active_streams:
             active_streams[info_hash].setdefault("ffmpeg_procs", []).append(proc)
 
     def _collect_stderr(p: subprocess.Popen) -> None:
-        assert p.stderr is not None
-        for raw in p.stderr:
+        for raw in (p.stderr or []):
             line = raw.decode(errors="replace").strip()
             if line:
                 with stderr_lock:
@@ -1500,6 +1531,22 @@ def addon_start():
 
     tracks = get_track_info(file_path)
 
+    # Detecta modo de transcode e inicia HLS em background (look-ahead)
+    transcode_mode_detected = auto_transcode_mode(file_path)
+
+    def _lookahead_hls(ih: str, fp: str, mode: str) -> None:
+        try:
+            start_hls_transcode(ih, fp, mode)
+            print(f"🔭 Look-ahead HLS [{mode}] pronto para {ih[:8]}")
+        except Exception as e:
+            print(f"⚠ Look-ahead error: {e}")
+
+    threading.Thread(
+        target=_lookahead_hls,
+        args=(info_hash, file_path, transcode_mode_detected),
+        daemon=True,
+    ).start()
+
     s = handle.status()
 
     # Detecta automaticamente o modo de transcode necessário
@@ -1722,26 +1769,64 @@ def transcode_status(info_hash):
 # ── /status ───────────────────────────────────────────────────────────────────
 @app.route("/status")
 def status():
+    """
+    Status detalhado com buffer_health, is_header_ready e bitrate_estimate.
+    O front-end usa is_header_ready para saber quando dar play,
+    e buffer_health para mostrar quantos segundos de HLS estão prontos.
+    """
     result = []
     for h in ses.get_torrents():
         s  = h.status()
         ih = str(s.info_hash).lower()
+
         with active_streams_lock:
             entry = active_streams.get(ih, {})
+
+        file_path = entry.get("file_path", "")
+        file_size = entry.get("file_size", 0)
+
+        # is_header_ready: arquivo existe e tem pelo menos 5MB no disco
+        is_header_ready = False
+        if file_path and os.path.exists(file_path):
+            try:
+                on_disk = os.path.getsize(file_path)
+                is_header_ready = on_disk >= min(5 * 1024 * 1024, max(1, int(file_size * 0.02)))
+            except OSError:
+                pass
+
+        # buffer_health: segmentos HLS já gerados × duração de cada um
+        buffer_health = 0
+        for m in ("audio", "full", "copy"):
+            d = os.path.join(HLS_CACHE_PATH, f"{ih[:16]}_{m}")
+            if os.path.isdir(d):
+                segs = len([f for f in os.listdir(d) if f.endswith(".ts")])
+                buffer_health = segs * HLS_SEGMENT_SECS
+                break
+
+        # bitrate_estimate kbps: tamanho / duração assumida (2h fallback)
+        bitrate_kbps = int((file_size * 8) / 7200 / 1000) if file_size > 0 else 0
+
         result.append({
             "name":               s.name,
             "info_hash":          ih,
             "progress":           round(s.progress * 100, 1),
-            "progress_str":       f"{s.progress*100:.1f}%",
+            "progress_str":       f"{s.progress * 100:.1f}%",
+            "is_header_ready":    is_header_ready,
+            "buffer_health":      buffer_health,
+            "buffer_health_str":  f"{buffer_health}s prontos",
+            "bitrate_estimate":   bitrate_kbps,
+            "bitrate_str":        f"{bitrate_kbps} kbps",
             "download_rate_kbps": round(s.download_rate / 1024, 1),
-            "download_rate_str":  f"{s.download_rate/1024:.1f} KB/s",
+            "download_rate_str":  f"{s.download_rate / 1024:.1f} KB/s",
             "upload_rate_kbps":   round(s.upload_rate / 1024, 1),
-            "upload_rate_str":    f"{s.upload_rate/1024:.1f} KB/s",
+            "upload_rate_str":    f"{s.upload_rate / 1024:.1f} KB/s",
             "peers":              s.num_peers,
             "state":              str(s.state),
             "stream_url":         f"/stream/{ih}" if ih in active_streams else None,
+            "hls_url":            f"/hls/{ih}/index.m3u8" if ih in active_streams else None,
             "has_track_info":     bool(entry.get("track_info")),
         })
+
     return jsonify({
         "status":        "online",
         "torrents":      result,
