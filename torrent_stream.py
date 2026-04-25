@@ -1094,6 +1094,166 @@ def kill_ffmpeg_procs(info_hash: str) -> None:
 def ping():
     return jsonify({"status": "online", "version": "3.0.0"})
 
+# ── /subtitles/proxy ──────────────────────────────────────────────────────────
+# Headers que causam problemas de CORS ou conflito quando repassados ao browser
+_BLOCKED_RESPONSE_HEADERS = {
+    "access-control-allow-origin",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "strict-transport-security",
+    "transfer-encoding",   # chunked não combina com content-length fixo
+    "connection",
+    "keep-alive",
+    "server",
+    "vary",
+}
+
+@app.route("/subtitles/proxy")
+def subtitle_proxy():
+    """
+    Proxy universal para legendas e traduções — resolve todos os problemas de CORS.
+
+    Uso:
+      GET /subtitles/proxy?url=https://exemplo.com/legenda.vtt
+      GET /subtitles/proxy?url=https://translate.googleapis.com/...
+
+    Funcionalidades:
+      - Remove headers CORS do servidor remoto (causam conflito com os nossos)
+      - Adiciona Access-Control-Allow-Origin: * para o browser aceitar
+      - Detecta e converte SRT → WebVTT automaticamente
+      - Suporta JSON (Google Translate, APIs de legenda) e texto (VTT, SRT)
+      - Timeout agressivo (12s) para não travar o front
+
+    Exemplos de uso no front:
+      // Baixar VTT de servidor externo sem CORS
+      /subtitles/proxy?url=https://opensubtitles.strem.io/...
+
+      // Google Translate via gtx (sem CORS)
+      /subtitles/proxy?url=https://translate.googleapis.com/translate_a/single?client=gtx&...
+    """
+    target_url = request.args.get("url", "").strip()
+    if not target_url:
+        return jsonify({"error": "Parâmetro 'url' é obrigatório"}), 400
+
+    # Segurança básica: só permite http/https
+    if not target_url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL deve usar http ou https"}), 400
+
+    # Headers que imitam um browser real — essencial para Google Translate e afins
+    req_headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Accept-Encoding": "identity",   # sem gzip — simplifica o decode
+        "Connection":      "keep-alive",
+        "Referer":         "https://web.stremio.com/",
+    }
+
+    # Repassa headers do cliente que fazem sentido (Range, Accept, etc.)
+    for h in ("Accept", "Accept-Language", "Range"):
+        val = request.headers.get(h)
+        if val:
+            req_headers[h] = val
+
+    try:
+        resp = http_requests.get(
+            target_url,
+            headers=req_headers,
+            timeout=12,
+            allow_redirects=True,
+            stream=False,   # lê tudo de uma vez — necessário para conversão SRT→VTT
+        )
+    except http_requests.exceptions.ConnectionError:
+        return jsonify({"error": "Não foi possível conectar ao servidor remoto"}), 502
+    except http_requests.exceptions.Timeout:
+        return jsonify({"error": "Servidor remoto não respondeu em 12s"}), 504
+    except Exception as e:
+        return jsonify({"error": f"Erro na requisição: {str(e)[:200]}"}), 502
+
+    # ── Detecta o tipo de conteúdo real ──────────────────────────────────────
+    raw_content_type = resp.headers.get("Content-Type", "").lower()
+    body_bytes       = resp.content
+
+    # Tenta decodificar como texto
+    encoding = resp.encoding or "utf-8"
+    try:
+        body_text = body_bytes.decode(encoding, errors="replace")
+    except Exception:
+        body_text = body_bytes.decode("utf-8", errors="replace")
+
+    # ── Conversão automática SRT → WebVTT ─────────────────────────────────────
+    is_vtt_request = (
+        ".vtt" in target_url.lower()
+        or "text/vtt" in raw_content_type
+        or "webvtt" in body_text[:20].lower()
+    )
+    is_srt = (
+        ".srt" in target_url.lower()
+        or "application/x-subrip" in raw_content_type
+        or (body_text[:200].strip() and body_text[:10].strip().isdigit())
+    )
+
+    if is_srt and not body_text.strip().startswith("WEBVTT"):
+        # Converte SRT → VTT: substitui vírgula por ponto nos timestamps
+        body_text = "WEBVTT\n\n" + re.sub(
+            r"(\d{2}:\d{2}:\d{2}),(\d{3})",
+            r"\1.\2",
+            body_text,
+        )
+        # Remove números de sequência (linhas que são só dígitos)
+        body_text = re.sub(r"^\d+$", "", body_text, flags=re.MULTILINE)
+        final_content_type = "text/vtt; charset=utf-8"
+        final_body = body_text.encode("utf-8")
+
+    elif is_vtt_request or "text/vtt" in raw_content_type:
+        final_content_type = "text/vtt; charset=utf-8"
+        final_body = body_text.encode("utf-8")
+
+    elif "json" in raw_content_type or body_text.strip().startswith(("[", "{")):
+        # JSON (Google Translate, APIs de subtitle) — repassa como JSON
+        final_content_type = "application/json; charset=utf-8"
+        final_body = body_bytes
+
+    else:
+        # Qualquer outro tipo — repassa como está
+        final_content_type = raw_content_type or "text/plain; charset=utf-8"
+        final_body = body_bytes
+
+    # ── Monta resposta com headers CORS corretos ──────────────────────────────
+    # Filtra headers do servidor remoto, mantém só os seguros
+    safe_headers: Dict[str, str] = {}
+    for key, val in resp.headers.items():
+        if key.lower() not in _BLOCKED_RESPONSE_HEADERS:
+            safe_headers[key] = val
+
+    # Garante que o browser aceite a resposta
+    safe_headers["Access-Control-Allow-Origin"]  = "*"
+    safe_headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    safe_headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
+    safe_headers["Content-Type"]   = final_content_type
+    safe_headers["Content-Length"] = str(len(final_body))
+    safe_headers["Cache-Control"]  = "public, max-age=300"   # 5min de cache
+
+    return Response(final_body, status=resp.status_code, headers=safe_headers)
+
+
+@app.route("/subtitles/proxy", methods=["OPTIONS"])
+def subtitle_proxy_options():
+    """Responde ao preflight CORS do browser."""
+    return Response("", status=204, headers={
+        "Access-Control-Allow-Origin":  "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Range",
+        "Access-Control-Max-Age":       "86400",
+    })
+
+
+
 
 # ── /transcode/test ───────────────────────────────────────────────────────────
 @app.route("/transcode/test")
