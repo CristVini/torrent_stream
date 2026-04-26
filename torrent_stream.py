@@ -18,6 +18,75 @@ import json
 import re
 from typing import Optional, List, Dict, Any
 
+# ── SUBPROCESS UTILS ─────────────────────────────────────────────────────────
+# Centraliza toda criação de subprocessos para evitar WinError 6 no Windows.
+# WinError 6 (Identificador Inválido) ocorre quando creationflags=CREATE_NO_WINDOW
+# é combinado com stdout/stderr=PIPE — o Windows fecha os handles antes do Python
+# conseguir lê-los. Solução: STARTUPINFO com SW_HIDE mantém os handles válidos.
+
+def _win_startupinfo():
+    """Retorna STARTUPINFO configurado para ocultar janela no Windows."""
+    if sys.platform != "win32":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0   # SW_HIDE
+    return si
+
+
+def _run(cmd: List[str], timeout: int = 15, text: bool = True) -> subprocess.CompletedProcess:
+    """
+    subprocess.run seguro no Windows e Linux.
+    Usa STARTUPINFO para ocultar janela SEM creationflags — evita WinError 6.
+    capture_output=True é gerenciado internamente pelo Python e é sempre seguro.
+    """
+    kwargs: dict = {"capture_output": True, "timeout": timeout}
+    if text:
+        kwargs["text"] = True
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
+    si = _win_startupinfo()
+    if si:
+        try:
+            return subprocess.run(cmd, **kwargs, startupinfo=si)
+        except OSError as e:
+            # WinError 6 = Identificador Inválido — STARTUPINFO falhou
+            # Acontece em alguns builds do Python 3.11 no Windows 11
+            if hasattr(e, "winerror") and e.winerror == 6:
+                print(f"⚠ _run WinError 6 com STARTUPINFO, fallback sem startupinfo: {cmd[0]}")
+            else:
+                raise
+    return subprocess.run(cmd, **kwargs)
+
+
+def _popen(cmd: List[str]) -> subprocess.Popen:
+    """
+    subprocess.Popen seguro no Windows e Linux para processos de longa duração.
+    stderr=PIPE com STARTUPINFO — nunca usa creationflags junto com PIPE.
+    """
+    kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+    }
+    si = _win_startupinfo()
+    if si:
+        try:
+            return subprocess.Popen(cmd, **kwargs, startupinfo=si)
+        except OSError as e:
+            if hasattr(e, "winerror") and e.winerror == 6:
+                print(f"⚠ _popen WinError 6 com STARTUPINFO, fallback: {cmd[0]}")
+            else:
+                raise
+    # Fallback final: tenta sem startupinfo
+    try:
+        return subprocess.Popen(cmd, **kwargs)
+    except OSError:
+        # Último recurso: sem captura de stderr
+        print(f"⚠ _popen PIPE falhou, abrindo sem stderr: {cmd[0]}")
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 STREMIO_ADDONS = [
     "https://torrentio.strem.fun",
@@ -252,9 +321,9 @@ def cleanup_all() -> None:
 def get_track_info(file_path: str) -> dict:
     result: dict = {"audio_tracks": [], "subtitle_tracks": [], "ffprobe_available": False}
     try:
-        proc = subprocess.run(
+        proc = _run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", file_path],
-            capture_output=True, text=True, timeout=15,
+            timeout=15,
         )
         if proc.returncode != 0:
             return result
@@ -729,13 +798,13 @@ def detect_gpu_encoder() -> str:
 
         for encoder, label in [("h264_nvenc", "NVIDIA NVENC"), ("h264_qsv", "Intel QSV")]:
             try:
-                proc = subprocess.run(
+                proc = _run(
                     [
                         "ffmpeg", "-hide_banner", "-loglevel", "error",
                         "-f", "lavfi", "-i", "nullsrc=s=64x64:d=1",
                         "-c:v", encoder, "-frames:v", "1", "-f", "null", "-",
                     ],
-                    capture_output=True, timeout=10,
+                    timeout=10, text=False,
                 )
                 if proc.returncode == 0:
                     print(f"✅ GPU encoder: {label} ({encoder})")
@@ -771,28 +840,31 @@ def _probe_streams(file_path: str) -> dict:
     Roda ffprobe UMA vez e retorna dict com video_codec e audio_codec.
     Evita chamar ffprobe duas vezes separadas.
     """
-    result = {"video_codec": "", "audio_codec": "", "audio_channels": 2}
+    result = {
+        "video_codec": "", "audio_codec": "", "audio_channels": 2,
+        "audio_tracks_count": 1, "video_pix_fmt": "", "video_profile": "",
+    }
     try:
-        proc = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                file_path,
-            ],
-            capture_output=True, text=True, timeout=12,
+        proc = _run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", file_path],
+            timeout=15,
         )
         if proc.returncode != 0:
             return result
-
         streams = json.loads(proc.stdout).get("streams", [])
+        audio_count = 0
         for s in streams:
             ct = s.get("codec_type", "")
             if ct == "video" and not result["video_codec"]:
-                result["video_codec"] = s.get("codec_name", "").lower()
-            if ct == "audio" and not result["audio_codec"]:
-                result["audio_codec"]    = s.get("codec_name", "").lower()
-                result["audio_channels"] = s.get("channels", 2)
+                result["video_codec"]   = s.get("codec_name", "").lower()
+                result["video_pix_fmt"] = s.get("pix_fmt", "").lower()
+                result["video_profile"] = s.get("profile", "").lower()
+            if ct == "audio":
+                audio_count += 1
+                if not result["audio_codec"]:
+                    result["audio_codec"]    = s.get("codec_name", "").lower()
+                    result["audio_channels"] = s.get("channels", 2)
+        result["audio_tracks_count"] = max(1, audio_count)
     except Exception as e:
         print(f"_probe_streams error: {e}")
     return result
@@ -816,30 +888,24 @@ AUDIO_NEEDS_TRANSCODE = {
 
 def auto_transcode_mode(file_path: str) -> str:
     """
-    Retorna o modo de transcode mínimo necessário:
-      'copy'  → tudo compatível, só remux para HLS
-      'audio' → vídeo ok, áudio DDP/DTS precisa virar AAC
-      'full'  → vídeo HEVC/AV1 + qualquer áudio
+    'copy'  → browser suporta nativamente
+    'audio' → DDP/DTS/AC3 → AAC, vídeo intocado
+    'full'  → HEVC/AV1/10-bit → H.264 + áudio → AAC
     """
-    info = _probe_streams(file_path)
-    v    = info["video_codec"]
-    a    = info["audio_codec"]
-
-    print(f"🔍 Probe: video={v!r} audio={a!r} channels={info['audio_channels']}")
-
-    needs_v = v in VIDEO_NEEDS_TRANSCODE
+    info    = _probe_streams(file_path)
+    v       = info["video_codec"]
+    a       = info["audio_codec"]
+    pix_fmt = info.get("video_pix_fmt", "")
+    profile = info.get("video_profile", "")
+    is_10bit = ("10le" in pix_fmt or "10be" in pix_fmt or
+                "hi10p" in profile.lower() or "main 10" in profile.lower())
+    print(f"🔍 Probe: video={v!r} pix={pix_fmt!r} profile={profile!r} 10bit={is_10bit}")
+    print(f"         audio={a!r} channels={info['audio_channels']}")
+    needs_v = v in VIDEO_NEEDS_TRANSCODE or is_10bit
     needs_a = a in AUDIO_NEEDS_TRANSCODE
-
-    if needs_v:
-        mode = "full"
-    elif needs_a:
-        mode = "audio"
-    else:
-        mode = "copy"
-
-    print(f"🔧 Transcode mode: {mode}  (video_compat={not needs_v}, audio_compat={not needs_a})")
+    mode = "full" if needs_v else ("audio" if needs_a else "copy")
+    print(f"🔧 Transcode mode: {mode}")
     return mode
-
 
 def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
     """
@@ -915,11 +981,9 @@ def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
         # EAC3 / AC3 / DTS / TrueHD → AAC Stereo 2.0 192kbps
         # -af aformat força o downmix ANTES do encoder → mais seguro que -ac 2 sozinho
         audio_args = [
-            "-c:a",  "aac",
-            "-b:a",  "192k",
-            "-ac",   "2",
-            "-ar",   "48000",
-            "-af",   "aformat=channel_layouts=stereo",
+            "-c:a", "aac", "-b:a", "192k",
+            "-ac",  "2",   "-ar",  "48000",
+            "-af",  "aresample=resampler=swr,aformat=channel_layouts=stereo",
         ]
 
     # ── Monta o comando FFmpeg ────────────────────────────────────────────────
@@ -934,7 +998,7 @@ def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
         "-fflags",       "+genpts+igndts",
         "-analyzeduration", "10000000",   # 10s de análise (necessário para DDP)
         "-probesize",    "10000000",
-        "-i",            file_path,
+        "-i",            os.path.normpath(file_path),
 
         # Mapeamento explícito — vídeo e áudio, sem legendas no stream
         "-map", "0:v:0",   # primeiro stream de vídeo
@@ -947,7 +1011,7 @@ def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
         "-f",                "hls",
         "-hls_time",         str(HLS_SEGMENT_SECS),
         "-hls_list_size",    "0",
-        "-hls_flags",        "independent_segments+append_list+delete_segments",
+        "-hls_flags",        "independent_segments+append_list",
         "-hls_segment_type", "mpegts",
         "-hls_segment_filename", seg_pattern,
         "-start_number",     "0",
@@ -973,18 +1037,7 @@ def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
     # IMPORTANTE: No Windows, CREATE_NO_WINDOW + stderr=PIPE causa WinError 6
     # (Identificador Inválido). A solução é usar STARTUPINFO para ocultar a janela
     # sem fechar os handles de pipe.
-    _popen_kwargs: dict = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.PIPE,
-    }
-    if sys.platform == "win32":
-        _si = subprocess.STARTUPINFO()
-        _si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
-        _si.wShowWindow = 0   # SW_HIDE
-        _popen_kwargs["startupinfo"] = _si
-        # NÃO usar creationflags=CREATE_NO_WINDOW com PIPE — causa WinError 6
-
-    proc = subprocess.Popen(cmd, **_popen_kwargs)
+    proc = _popen(cmd)
 
     with active_streams_lock:
         if info_hash in active_streams:
@@ -1065,10 +1118,10 @@ def extract_subtitle_vtt(info_hash: str, file_path: str, stream_index: int = 0) 
 
     try:
         # Verifica se a trilha existe e qual é o codec
-        probe = subprocess.run(
+        probe = _run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_streams", "-select_streams", f"s:{stream_index}", file_path],
-            capture_output=True, text=True, timeout=10,
+            timeout=10,
         )
         streams = json.loads(probe.stdout).get("streams", [])
         if not streams:
@@ -1088,7 +1141,7 @@ def extract_subtitle_vtt(info_hash: str, file_path: str, stream_index: int = 0) 
             "-f",   "webvtt",
             vtt_path,
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        proc = _run(cmd, timeout=120, text=False)
         if proc.returncode == 0 and os.path.exists(vtt_path) and os.path.getsize(vtt_path) > 0:
             print(f"💬 Legenda {stream_index} ({sub_codec}) → {vtt_path}")
             return vtt_path
@@ -1311,10 +1364,7 @@ def transcode_test():
 
     # Testa ffmpeg
     try:
-        r = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True, text=True, timeout=5,
-        )
+        r = _run(["ffmpeg", "-version"], timeout=5)
         if r.returncode == 0:
             ffmpeg_ok  = True
             # Extrai versão da primeira linha
@@ -1331,10 +1381,7 @@ def transcode_test():
 
     # Testa ffprobe
     try:
-        r = subprocess.run(
-            ["ffprobe", "-version"],
-            capture_output=True, text=True, timeout=5,
-        )
+        r = _run(["ffprobe", "-version"], timeout=5)
         ffprobe_ok = r.returncode == 0
         if not ffprobe_ok:
             issues.append("ffprobe não funciona — reinstale o FFmpeg")
@@ -1625,7 +1672,19 @@ def hls_playlist(info_hash):
     try:
         m3u8_path = start_hls_transcode(info_hash, file_path, mode)
     except FFmpegError as e:
-        return jsonify(e.to_dict()), 500
+        err_dict = e.to_dict()
+        # Auto-retry: GPU falhou → libx264 (CPU)
+        if e.encoder in ("h264_nvenc", "h264_qsv"):
+            print(f"⚠ GPU {e.encoder} falhou — retry com libx264 (CPU)...")
+            global _gpu_encoder
+            _gpu_encoder = "libx264"
+            shutil.rmtree(_hls_cache_dir(info_hash, mode), ignore_errors=True)
+            try:
+                m3u8_path = start_hls_transcode(info_hash, file_path, mode)
+            except FFmpegError as e2:
+                return jsonify(e2.to_dict()), 500
+        else:
+            return jsonify(err_dict), 500
     except RuntimeError as e:
         return jsonify({"error": str(e), "hints": ["Verifique os logs do servidor"]}), 500
 
