@@ -1,4 +1,4 @@
-name: Build Windows EXE (Nuitka)
+name: Build Windows EXE (Nuitka) - v2 (SSE + DLNA)
 
 on:
   push:
@@ -38,15 +38,14 @@ jobs:
             nuitka `
             ordered-set `
             zstandard
-          python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
-          python -c "import requests;   print('requests   OK:', requests.__version__)"
-          python -c "import nyaapy;     print('nyaapy     OK')"
+          # Verificação de bibliotecas críticas
+          python -c "import libtorrent; print('libtorrent OK')"
+          python -c "import flask;      print('flask      OK')"
 
       - name: Compilar com Nuitka
         run: |
           $lt_file = python -c "import libtorrent; print(libtorrent.__file__)"
-          Write-Host "libtorrent file: $lt_file"
-
+          
           $nuitka_args = @(
             "-m", "nuitka",
             "--onefile",
@@ -54,6 +53,23 @@ jobs:
             "--assume-yes-for-downloads",
             "--enable-plugin=tk-inter",
             "--output-filename=torrent_stream.exe",
+
+            # ── MODULARIZAÇÃO E NOVOS MÓDULOS ────────────────────────────────
+            # Inclui as pastas de lógica e motores de busca
+            "--include-package=core",
+            "--include-package=engines",
+            
+            # Garante que o Nuitka siga os imports do dlnap.py e cast.py
+            "--follow-imports",
+
+            # ── DEPENDÊNCIAS DE REDE (DLNA) ──────────────────────────────────
+            # O dlnap usa sockets e servidores HTTP internos, garantimos que
+            # os módulos padrão de rede do Python estejam presentes.
+            "--include-module=socket",
+            "--include-module=select",
+            "--include-module=http.server",
+            "--include-module=urllib.request",
+            "--include-module=xml.etree.ElementTree",
 
             # Flask stack
             "--include-package=flask",
@@ -80,26 +96,31 @@ jobs:
           )
 
           if (Test-Path "icon.ico") {
-            Write-Host "Ícone encontrado."
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
-          $nuitka_args += "torrent_stream.py"
+          # Ponto de entrada: main.py (Modular) ou torrent_stream.py (Consolidado)
+          if (Test-Path "main.py") {
+            $nuitka_args += "main.py"
+          } else {
+            $nuitka_args += "torrent_stream.py"
+          }
+
           python @nuitka_args
 
       - name: Verificar EXE gerado
         run: |
           if (Test-Path "torrent_stream.exe") {
             $size = (Get-Item "torrent_stream.exe").length / 1MB
-            Write-Host "✅ torrent_stream.exe gerado — $([math]::Round($size,1)) MB"
+            Write-Host "✅ EXE gerado com sucesso: $([math]::Round($size,1)) MB"
           } else {
-            Write-Error "❌ EXE não encontrado!"
+            Write-Error "❌ Falha ao gerar o executável!"
             exit 1
           }
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
         with:
-          name: torrent_stream_windows
+          name: torrent_stream_windows_v2
           path: torrent_stream.exe
           retention-days: 30
