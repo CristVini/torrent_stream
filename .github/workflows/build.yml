@@ -1,4 +1,4 @@
-name: Build Windows EXE (Nuitka) - v2 (SSE + DLNA)
+name: Build Windows EXE (Nuitka) - v4 (Final GUI)
 
 on:
   push:
@@ -38,9 +38,7 @@ jobs:
             nuitka `
             ordered-set `
             zstandard
-          # Verificação de bibliotecas críticas
           python -c "import libtorrent; print('libtorrent OK')"
-          python -c "import flask;      print('flask      OK')"
 
       - name: Compilar com Nuitka
         run: |
@@ -51,20 +49,19 @@ jobs:
             "--onefile",
             "--standalone",
             "--assume-yes-for-downloads",
+            
+            # ── INTERFACE GRÁFICA (RESTORED) ─────────────────────────────────
             "--enable-plugin=tk-inter",
+            "--windows-console-mode=disable", # Remove a janela preta, abre apenas a GUI
+            
             "--output-filename=torrent_stream.exe",
 
-            # ── MODULARIZAÇÃO E NOVOS MÓDULOS ────────────────────────────────
-            # Inclui as pastas de lógica e motores de busca
+            # ── INCLUSÃO DE MÓDULOS ──────────────────────────────────────────
             "--include-package=core",
             "--include-package=engines",
-            
-            # Garante que o Nuitka siga os imports do dlnap.py e cast.py
             "--follow-imports",
 
-            # ── DEPENDÊNCIAS DE REDE (DLNA) ──────────────────────────────────
-            # O dlnap usa sockets e servidores HTTP internos, garantimos que
-            # os módulos padrão de rede do Python estejam presentes.
+            # Dependências de rede e sistema
             "--include-module=socket",
             "--include-module=select",
             "--include-module=http.server",
@@ -90,21 +87,15 @@ jobs:
             "--include-package=nyaapy",
 
             # libtorrent native extension
-            "--include-data-files=$lt_file=libtorrent.pyd",
-
-            "--windows-console-mode=attach"
+            "--include-data-files=$lt_file=libtorrent.pyd"
           )
 
           if (Test-Path "icon.ico") {
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
-          # Ponto de entrada: main.py (Modular) ou torrent_stream.py (Consolidado)
-          if (Test-Path "main.py") {
-            $nuitka_args += "main.py"
-          } else {
-            $nuitka_args += "torrent_stream.py"
-          }
+          # Ponto de entrada modular
+          $nuitka_args += "main.py"
 
           python @nuitka_args
 
@@ -114,13 +105,13 @@ jobs:
             $size = (Get-Item "torrent_stream.exe").length / 1MB
             Write-Host "✅ EXE gerado com sucesso: $([math]::Round($size,1)) MB"
           } else {
-            Write-Error "❌ Falha ao gerar o executável!"
+            Write-Error "❌ Falha no build!"
             exit 1
           }
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
         with:
-          name: torrent_stream_windows_v2
+          name: torrent_stream_final
           path: torrent_stream.exe
           retention-days: 30

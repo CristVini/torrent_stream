@@ -1,12 +1,15 @@
 import os
 import sys
+import json
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
-STREMIO_ADDONS = [
+DEFAULT_ADDONS = [
     "https://torrentio.strem.fun",
     "https://mediafusion.elfhosted.com",
     "https://comet.elfhosted.com",
 ]
+
+STREMIO_ADDONS = list(DEFAULT_ADDONS)
 
 ADDON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -14,7 +17,35 @@ ADDON_HEADERS = {
     "Referer": "https://web.stremio.com/",
 }
 
-CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), "torrent_stream_config.txt")
+# Caminho para o arquivo de configuração persistente
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".torrent_stream")
+os.makedirs(CONFIG_DIR, exist_ok=True)
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+
+def load_settings():
+    global STREMIO_ADDONS, DOWNLOAD_PATH
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+                STREMIO_ADDONS = data.get("addons", DEFAULT_ADDONS)
+                return data
+        except Exception:
+            pass
+    return {}
+
+def save_settings(addons=None, download_path=None):
+    data = load_settings()
+    if addons is not None:
+        data["addons"] = addons
+    if download_path is not None:
+        data["download_path"] = download_path
+    
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"Erro ao salvar configurações: {e}")
 
 CONTENT_TYPES = {
     ".mp4":  "video/mp4",
@@ -42,7 +73,11 @@ HLS_SEGMENT_SECS = 6
 BUFFER_READY_BYTES = 3 * 1024 * 1024   # 3 MB
 BUFFER_READY_TIMEOUT_S = 120           # 2 min máximo de espera
 
-# Variáveis globais que serão inicializadas no main
+# Variáveis globais
 DOWNLOAD_PATH = ""
 IS_TEMPORARY  = True
 HLS_CACHE_PATH = ""
+
+# Carrega as configurações ao importar o módulo
+settings = load_settings()
+DOWNLOAD_PATH = settings.get("download_path", "")
