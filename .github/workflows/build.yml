@@ -1,4 +1,4 @@
-name: Build Windows EXE (Nuitka) - v4 (Final GUI)
+name: Build Windows EXE (Nuitka) - v6 (Based on Original)
 
 on:
   push:
@@ -38,37 +38,27 @@ jobs:
             nuitka `
             ordered-set `
             zstandard
-          python -c "import libtorrent; print('libtorrent OK')"
+          python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
 
       - name: Compilar com Nuitka
         run: |
           $lt_file = python -c "import libtorrent; print(libtorrent.__file__)"
-          
+          Write-Host "libtorrent file: $lt_file"
+
           $nuitka_args = @(
             "-m", "nuitka",
             "--onefile",
             "--standalone",
             "--assume-yes-for-downloads",
-            
-            # ── INTERFACE GRÁFICA (RESTORED) ─────────────────────────────────
             "--enable-plugin=tk-inter",
-            "--windows-console-mode=disable", # Remove a janela preta, abre apenas a GUI
-            
             "--output-filename=torrent_stream.exe",
 
-            # ── INCLUSÃO DE MÓDULOS ──────────────────────────────────────────
+            # ── INCLUSÃO DE MÓDULOS MODULARES (NOVO) ────────────────────────
             "--include-package=core",
             "--include-package=engines",
             "--follow-imports",
 
-            # Dependências de rede e sistema
-            "--include-module=socket",
-            "--include-module=select",
-            "--include-module=http.server",
-            "--include-module=urllib.request",
-            "--include-module=xml.etree.ElementTree",
-
-            # Flask stack
+            # Flask stack (Igual ao seu original)
             "--include-package=flask",
             "--include-package=flask_cors",
             "--include-package=werkzeug",
@@ -77,7 +67,7 @@ jobs:
             "--include-package=itsdangerous",
             "--include-package=markupsafe",
 
-            # HTTP + scraping
+            # HTTP + scraping (Igual ao seu original)
             "--include-package=requests",
             "--include-package=urllib3",
             "--include-package=certifi",
@@ -86,32 +76,37 @@ jobs:
             "--include-package=bs4",
             "--include-package=nyaapy",
 
-            # libtorrent native extension
-            "--include-data-files=$lt_file=libtorrent.pyd"
+            # libtorrent native extension (Igual ao seu original)
+            "--include-data-files=$lt_file=libtorrent.pyd",
+
+            # ── MODO DE CONSOLE (O SEGREDO) ──────────────────────────────────
+            # Restaurado para 'attach' como no seu original que funcionava
+            "--windows-console-mode=attach"
           )
 
           if (Test-Path "icon.ico") {
+            Write-Host "Ícone encontrado."
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
-          # Ponto de entrada modular
+          # Ponto de entrada (Ajustado para main.py da versão modular)
           $nuitka_args += "main.py"
-
+          
           python @nuitka_args
 
       - name: Verificar EXE gerado
         run: |
           if (Test-Path "torrent_stream.exe") {
             $size = (Get-Item "torrent_stream.exe").length / 1MB
-            Write-Host "✅ EXE gerado com sucesso: $([math]::Round($size,1)) MB"
+            Write-Host "✅ torrent_stream.exe gerado — $([math]::Round($size,1)) MB"
           } else {
-            Write-Error "❌ Falha no build!"
+            Write-Error "❌ EXE não encontrado!"
             exit 1
           }
 
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
         with:
-          name: torrent_stream_final
+          name: torrent_stream_windows_v6
           path: torrent_stream.exe
           retention-days: 30
