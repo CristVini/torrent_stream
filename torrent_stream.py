@@ -19,51 +19,34 @@ import re
 from typing import Optional, List, Dict, Any
 
 # ── SUBPROCESS UTILS ─────────────────────────────────────────────────────────
-# Centraliza toda criação de subprocessos para evitar WinError 6 no Windows.
-# WinError 6 (Identificador Inválido) ocorre quando creationflags=CREATE_NO_WINDOW
-# é combinado com stdout/stderr=PIPE — o Windows fecha os handles antes do Python
-# conseguir lê-los. Solução: STARTUPINFO com SW_HIDE mantém os handles válidos.
-
 def _win_startupinfo():
-    """Retorna STARTUPINFO configurado para ocultar janela no Windows."""
     if sys.platform != "win32":
         return None
     si = subprocess.STARTUPINFO()
     si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0   # SW_HIDE
+    si.wShowWindow = 0
     return si
 
 
 def _run(cmd: List[str], timeout: int = 15, text: bool = True) -> subprocess.CompletedProcess:
-    """
-    subprocess.run seguro no Windows e Linux.
-    Usa STARTUPINFO para ocultar janela SEM creationflags — evita WinError 6.
-    capture_output=True é gerenciado internamente pelo Python e é sempre seguro.
-    """
     kwargs: dict = {"capture_output": True, "timeout": timeout}
     if text:
-        kwargs["text"] = True
+        kwargs["text"]     = True
         kwargs["encoding"] = "utf-8"
-        kwargs["errors"] = "replace"
+        kwargs["errors"]   = "replace"
     si = _win_startupinfo()
     if si:
         try:
             return subprocess.run(cmd, **kwargs, startupinfo=si)
         except OSError as e:
-            # WinError 6 = Identificador Inválido — STARTUPINFO falhou
-            # Acontece em alguns builds do Python 3.11 no Windows 11
             if hasattr(e, "winerror") and e.winerror == 6:
-                print(f"⚠ _run WinError 6 com STARTUPINFO, fallback sem startupinfo: {cmd[0]}")
+                print(f"⚠ _run WinError 6 com STARTUPINFO, fallback: {cmd[0]}")
             else:
                 raise
     return subprocess.run(cmd, **kwargs)
 
 
 def _popen(cmd: List[str]) -> subprocess.Popen:
-    """
-    subprocess.Popen seguro no Windows e Linux para processos de longa duração.
-    stderr=PIPE com STARTUPINFO — nunca usa creationflags junto com PIPE.
-    """
     kwargs: dict = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.PIPE,
@@ -77,14 +60,11 @@ def _popen(cmd: List[str]) -> subprocess.Popen:
                 print(f"⚠ _popen WinError 6 com STARTUPINFO, fallback: {cmd[0]}")
             else:
                 raise
-    # Fallback final: tenta sem startupinfo
     try:
         return subprocess.Popen(cmd, **kwargs)
     except OSError:
-        # Último recurso: sem captura de stderr
         print(f"⚠ _popen PIPE falhou, abrindo sem stderr: {cmd[0]}")
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -115,25 +95,36 @@ VIDEO_EXTS = set(CONTENT_TYPES.keys())
 
 QUALITY_ORDER = {"4K": 0, "2160P": 0, "1080P": 1, "720P": 2, "480P": 3, "SD": 4}
 
-# Nyaa categories
-NYAA_CAT_ANIME      = 1   # Anime (all)
-NYAA_CAT_ANIME_EN   = 12  # Anime - English-translated
-NYAA_CAT_ANIME_RAW  = 14  # Anime - Raw (for DUB detection)
+NYAA_CAT_ANIME    = 1
+NYAA_CAT_ANIME_EN = 12
+NYAA_CAT_ANIME_RAW = 14
 
-# ── TRANSCODE CONFIG ────────────────────────────────────────────────────────
-# Codecs de áudio que o browser NÃO suporta nativamente → precisam de transcode
 AUDIO_TRANSCODE_CODECS = {
     "eac3", "ac3", "dts", "truehd", "mlp", "flac",
     "dts-hd", "dts-x", "dolby_atmos", "thd",
 }
 
-# HLS: tamanho de cada segmento em segundos
 HLS_SEGMENT_SECS = 6
+HLS_CACHE_PATH   = ""
 
-# Pasta de cache de transcode (subpasta de DOWNLOAD_PATH, criada no start)
-HLS_CACHE_PATH = ""
+# ── FIX 1: Mínimo de bytes no disco antes de chamar o FFmpeg ────────────────
+# 3 MB garante que o moov atom e os primeiros frames do container estejam
+# gravados, eliminando a race condition "FFmpeg lê 0 bytes e morre".
+BUFFER_READY_BYTES = 3 * 1024 * 1024   # 3 MB
+BUFFER_READY_TIMEOUT_S = 120           # 2 min máximo de espera
 
-# GPU encoder detectado (preenchido na primeira chamada)
+# ── FIX 3: Um lock por info_hash para evitar dois FFmpegs no mesmo arquivo ──
+# Mapeamento info_hash → threading.Lock()
+_hls_start_locks: Dict[str, threading.Lock] = {}
+_hls_start_locks_meta = threading.Lock()   # protege o próprio dict
+
+def _get_hls_lock(info_hash: str) -> threading.Lock:
+    """Retorna (criando se necessário) o lock exclusivo deste info_hash."""
+    with _hls_start_locks_meta:
+        if info_hash not in _hls_start_locks:
+            _hls_start_locks[info_hash] = threading.Lock()
+        return _hls_start_locks[info_hash]
+
 _gpu_encoder: Optional[str] = None
 _gpu_lock = threading.Lock()
 
@@ -317,6 +308,50 @@ def cleanup_all() -> None:
         shutil.rmtree(DOWNLOAD_PATH, ignore_errors=True)
         print(f"🗑 Pasta temporária deletada: {DOWNLOAD_PATH}")
 
+# ── FIX 1: VIGILANTE DE BUFFER ───────────────────────────────────────────────
+def wait_for_buffer(file_path: str,
+                    min_bytes: int = BUFFER_READY_BYTES,
+                    timeout_s: int = BUFFER_READY_TIMEOUT_S) -> bool:
+    """
+    Bloqueia até que `file_path` exista no disco E tenha pelo menos `min_bytes`.
+
+    Por que isso resolve a race condition:
+      - bootstrap_magnet() cria o handle do torrent e prioriza as primeiras peças,
+        mas o libtorrent ainda não escreveu nada no disco nesse instante.
+      - Quando o FFmpeg é chamado logo depois, ele abre o arquivo, lê 0 bytes
+        (ou nem encontra o arquivo) e encerra com erro, deixando a pasta de cache
+        vazia e forçando um retry sem sentido.
+      - Aguardar 3 MB garante que o moov atom (MP4) ou o EBML header (MKV) já
+        estejam no disco, então o ffprobe/ffmpeg consegue identificar os streams
+        e começar a transcodificar normalmente.
+
+    Retorna True se o buffer ficou pronto, False se estourou o timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    logged_waiting = False
+
+    while time.monotonic() < deadline:
+        if os.path.exists(file_path):
+            try:
+                on_disk = os.path.getsize(file_path)
+            except OSError:
+                on_disk = 0
+
+            if on_disk >= min_bytes:
+                print(f"✅ Buffer pronto: {on_disk / 1024 / 1024:.1f} MB em disco → {os.path.basename(file_path)}")
+                return True
+
+            if not logged_waiting:
+                print(f"⏳ Aguardando buffer mínimo ({min_bytes // 1024 // 1024} MB)… "
+                      f"arquivo: {os.path.basename(file_path)}")
+                logged_waiting = True
+
+        time.sleep(0.5)
+
+    print(f"⚠ wait_for_buffer: timeout após {timeout_s}s — {file_path}")
+    return False
+
+
 # ── FFPROBE: TRACK INFO ─────────────────────────────────────────────────────
 def get_track_info(file_path: str) -> dict:
     result: dict = {"audio_tracks": [], "subtitle_tracks": [], "ffprobe_available": False}
@@ -466,7 +501,6 @@ def bootstrap_magnet(magnet: str):
 
     print(f"▶ {os.path.basename(file_path)}  ({file_size/1024/1024:.1f} MB)  [{content_type}]  hash={info_hash}")
 
-    # ── Fast-Start: prioriza primeiras peças (moov atom / header do container) ─
     try:
         piece_size    = ti.piece_length()
         header_bytes  = min(5 * 1024 * 1024, file_size // 20)
@@ -509,30 +543,21 @@ def _sort_streams(streams: List[dict]) -> List[dict]:
 
 # ── NYAA ENGINE ───────────────────────────────────────────────────────────────
 def _nyaa_detect_type(name: str) -> str:
-    """
-    Detecta se o resultado é dublado, legendado ou raw pelo nome do arquivo/grupo.
-    Retorna: "DUB" | "SUB" | "RAW" | ""
-    """
     n = name.lower()
     if any(x in n for x in ["dual audio", "dual-audio", "dub", "dubbed", "pt-br", "ptbr"]):
         return "DUB"
     if any(x in n for x in ["legendado", "leg.", "[pt]", "portuguese"]):
-        return "DUB"  # português legendado também é DUB para fins de filtragem
+        return "DUB"
     if any(x in n for x in ["sub", "subtitled", "english-translated", "horriblesubs",
                               "subsplease", "erai-raws"]):
         return "SUB"
     if any(x in n for x in ["raw", "uncensored"]):
         return "RAW"
-    return "SUB"  # padrão: assume legendado
+    return "SUB"
 
 def search_nyaa(keyword: str, episode: Optional[int] = None,
                 season: Optional[int] = None,
                 trusted_only: bool = False) -> List[dict]:
-    """
-    Busca no Nyaa.si via NyaaPy.
-    Constrói keyword inteligente: "Anime Name S01E01" ou "Anime Name episode 1".
-    Retorna lista normalizada no mesmo formato dos streams Stremio.
-    """
     try:
         from nyaapy.nyaasi.nyaa import Nyaa
     except ImportError:
@@ -540,7 +565,6 @@ def search_nyaa(keyword: str, episode: Optional[int] = None,
         return []
 
     try:
-        # Monta query com episódio se fornecido
         query = keyword.strip()
         if season and season > 1:
             query += f" S{season:02d}"
@@ -548,14 +572,12 @@ def search_nyaa(keyword: str, episode: Optional[int] = None,
             if season and season > 1:
                 query += f"E{episode:02d}"
             else:
-                # Season 1: usa formato "- 01" que é padrão no Nyaa para animes
                 query += f" - {episode:02d}"
 
-        filters = 2 if trusted_only else 0  # 2 = Trusted only, 0 = sem filtro
+        filters = 2 if trusted_only else 0
 
         print(f"🔍 Nyaa search: '{query}' filters={filters}")
 
-        # Busca em categoria Anime (inclui sub e dub)
         results = Nyaa.search(keyword=query, category=NYAA_CAT_ANIME, filters=filters)
 
         streams = []
@@ -568,7 +590,6 @@ def search_nyaa(keyword: str, episode: Optional[int] = None,
             if not magnet:
                 continue
 
-            # Extrai info_hash do magnet
             ih_match = re.search(r"btih:([a-fA-F0-9]{40})", magnet, re.IGNORECASE)
             if not ih_match:
                 continue
@@ -585,11 +606,10 @@ def search_nyaa(keyword: str, episode: Optional[int] = None,
                 "quality":  quality,
                 "size":     size,
                 "seeders":  int(seeders) if str(seeders).isdigit() else 0,
-                "dub_type": dub_type,   # "DUB" | "SUB" | "RAW"
+                "dub_type": dub_type,
                 "fileIdx":  None,
             })
 
-        # Ordena por seeders (mais seeds primeiro dentro de cada qualidade)
         streams.sort(key=lambda s: (-QUALITY_ORDER.get(s["quality"], 4), -s.get("seeders", 0)))
         print(f"🌸 Nyaa: {len(streams)} resultados para '{query}'")
         return streams
@@ -669,10 +689,6 @@ def resolve_kitsu_id(anime_name: str) -> Optional[str]:
 
 def build_stremio_ids(imdb_id: Optional[str], kitsu_id: Optional[str],
                       season: int, episode: int) -> List[str]:
-    """
-    Monta todos os IDs no formato Stremio.
-    Inclui fallback Season 1 pois muitos animes ficam indexados assim nos addons.
-    """
     ids = []
     if imdb_id:
         ids.append(f"{imdb_id}:{season}:{episode}")
@@ -694,16 +710,11 @@ def search_all_sources(
     use_nyaa: bool = True,
     nyaa_trusted: bool = False,
 ) -> List[dict]:
-    """
-    Busca em paralelo: Stremio addons (Torrentio, Comet, etc.) + Nyaa.si.
-    Deduplica por infoHash e ordena por qualidade.
-    """
     all_streams: List[dict] = []
     futures_map = {}
 
     with ThreadPoolExecutor(max_workers=16) as ex:
 
-        # ── Stremio addons ──────────────────────────────────────────────────
         if imdb_id or kitsu_id:
             ids_to_try = build_stremio_ids(imdb_id, kitsu_id, season, episode)
             for addon in STREMIO_ADDONS:
@@ -711,7 +722,6 @@ def search_all_sources(
                     fut = ex.submit(_fetch_addon_streams, addon, "series", mid)
                     futures_map[fut] = ("stremio", addon)
 
-        # ── Nyaa.si ─────────────────────────────────────────────────────────
         if use_nyaa and name:
             fut = ex.submit(search_nyaa, name, episode, season, nyaa_trusted)
             futures_map[fut] = ("nyaa", "nyaa.si")
@@ -723,7 +733,7 @@ def search_all_sources(
                 if source_type == "stremio":
                     all_streams.extend([_normalize_stremio_stream(s) for s in batch])
                 else:
-                    all_streams.extend(batch)  # Nyaa já vem normalizado
+                    all_streams.extend(batch)
             except Exception as e:
                 print(f"❗ Erro em {source_name}: {e}")
 
@@ -735,10 +745,6 @@ def search_all_sources(
 
 # ── FFMPEG ERROR ──────────────────────────────────────────────────────────────
 class FFmpegError(RuntimeError):
-    """
-    Erro rico do FFmpeg — carrega o contexto completo do que falhou
-    para que as rotas Flask possam devolver JSON detalhado ao front.
-    """
     def __init__(self, code: int, mode: str, video_codec: str,
                  audio_codec: str, encoder: str, detail: str) -> None:
         self.code        = code
@@ -751,13 +757,11 @@ class FFmpegError(RuntimeError):
 
     def to_dict(self) -> dict:
         hints = []
-
-        # Diagnóstico automático baseado no erro
         d = self.detail.lower()
         if "ffmpeg" in d and ("not found" in d or "no such file" in d):
             hints.append("FFmpeg não está instalado ou não está no PATH do sistema")
         if "no such stream" in d or "invalid stream" in d:
-            hints.append(f"Stream de vídeo/áudio não encontrado no arquivo")
+            hints.append("Stream de vídeo/áudio não encontrado no arquivo")
         if "nvenc" in d or "nvcuda" in d:
             hints.append("NVENC falhou — driver NVIDIA desatualizado ou GPU não suportada")
             hints.append("Tente forçar modo CPU: adicione ?encoder=cpu na URL do HLS")
@@ -786,11 +790,6 @@ class FFmpegError(RuntimeError):
 
 # ── GPU DETECTION ────────────────────────────────────────────────────────────
 def detect_gpu_encoder() -> str:
-    """
-    Testa NVENC (NVIDIA) e QSV (Intel) com capture_output=True.
-    capture_output é seguro no Windows — não sofre do WinError 6.
-    Retorna 'h264_nvenc', 'h264_qsv' ou 'libx264' (CPU fallback).
-    """
     global _gpu_encoder
     with _gpu_lock:
         if _gpu_encoder is not None:
@@ -836,10 +835,6 @@ def _is_hls_ready(cache_dir: str) -> bool:
 
 
 def _probe_streams(file_path: str) -> dict:
-    """
-    Roda ffprobe UMA vez e retorna dict com video_codec e audio_codec.
-    Evita chamar ffprobe duas vezes separadas.
-    """
     result = {
         "video_codec": "", "audio_codec": "", "audio_channels": 2,
         "audio_tracks_count": 1, "video_pix_fmt": "", "video_profile": "",
@@ -870,28 +865,14 @@ def _probe_streams(file_path: str) -> dict:
     return result
 
 
-# Codecs de vídeo que o browser Chrome/Firefox NÃO suporta
 VIDEO_NEEDS_TRANSCODE = {"hevc", "h265", "av1", "vp9", "mpeg2video", "mpeg4", "wmv3", "vc1"}
 
-# Codecs de áudio que o browser NÃO suporta nativamente
 AUDIO_NEEDS_TRANSCODE = {
-    "eac3",       # Dolby Digital Plus / DDP / DD+
-    "ac3",        # Dolby Digital / DD
-    "dts",        # DTS core
-    "truehd",     # Dolby TrueHD (Atmos)
-    "mlp",        # MLP (base de TrueHD)
-    "flac",       # FLAC (alguns browsers suportam, mas HLS/TS não)
-    "opus",       # Opus não funciona bem em TS/HLS
-    "vorbis",     # Vorbis idem
+    "eac3", "ac3", "dts", "truehd", "mlp", "flac", "opus", "vorbis",
 }
 
 
 def auto_transcode_mode(file_path: str) -> str:
-    """
-    'copy'  → browser suporta nativamente
-    'audio' → DDP/DTS/AC3 → AAC, vídeo intocado
-    'full'  → HEVC/AV1/10-bit → H.264 + áudio → AAC
-    """
     info    = _probe_streams(file_path)
     v       = info["video_codec"]
     a       = info["audio_codec"]
@@ -907,255 +888,404 @@ def auto_transcode_mode(file_path: str) -> str:
     print(f"🔧 Transcode mode: {mode}")
     return mode
 
+
+# ── FIX 3: start_hls_transcode com lock por info_hash ────────────────────────
 def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
     """
     Inicia FFmpeg em background e gera HLS segmentado.
+
+    FIX 1 — race condition:
+      Chama wait_for_buffer() antes de qualquer operação com FFmpeg.
+      Só avança quando há pelo menos BUFFER_READY_BYTES no disco.
+
+    FIX 3 — processo duplicado (WinError 32):
+      Um threading.Lock() exclusivo por info_hash garante que apenas uma
+      chamada a esta função esteja ativa por vez para o mesmo arquivo.
+      Se uma segunda chamada chegar enquanto a primeira ainda está rodando:
+        1. Ela tenta adquirir o lock e bloqueia.
+        2. Quando desbloqueada, confere _is_hls_ready → se o cache já existe,
+           retorna imediatamente sem criar um segundo processo.
 
     Modos:
       'copy'  → -c:v copy -c:a copy  (remux puro, ultra-leve)
       'audio' → -c:v copy -c:a aac   (DDP/DTS → AAC stereo, vídeo intocado)
       'full'  → H.264 via GPU/CPU + AAC stereo (HEVC/AV1 → H.264)
 
-    Retorna caminho do .m3u8. Se cache já existir, retorna imediatamente.
+    Retorna caminho do .m3u8.
     """
+    hls_lock  = _get_hls_lock(info_hash)
     cache_dir = _hls_cache_dir(info_hash, mode)
     m3u8_path = os.path.join(cache_dir, "index.m3u8")
 
+    # Verificação rápida fora do lock (otimização: evita bloquear na maioria dos casos)
     if _is_hls_ready(cache_dir):
-        print(f"♻ HLS cache hit: {cache_dir}")
+        print(f"♻ HLS cache hit (pre-lock): {cache_dir}")
         return m3u8_path
 
-    info    = _probe_streams(file_path)
-    v_codec = info["video_codec"]
-    a_codec = info["audio_codec"]
-    encoder = detect_gpu_encoder()
-
-    # ── Vídeo ────────────────────────────────────────────────────────────────
-    if mode in ("copy", "audio"):
-        video_args = ["-c:v", "copy"]
-
-    elif encoder == "h264_nvenc":
-        video_args = [
-            "-c:v", "h264_nvenc",
-            "-preset",   "p4",
-            "-rc",       "vbr",
-            "-cq",       "23",
-            "-b:v",      "0",
-            "-profile:v", "high",
-            "-level:v",  "4.1",
-            # Para HEVC com 10-bit: força 8-bit de saída
-            "-pix_fmt",  "yuv420p",
-        ]
-
-    elif encoder == "h264_qsv":
-        video_args = [
-            "-c:v", "h264_qsv",
-            "-global_quality", "23",
-            "-look_ahead",     "1",
-            "-profile:v",      "high",
-            "-pix_fmt",        "yuv420p",
-        ]
-
-    else:  # libx264 CPU
-        video_args = [
-            "-c:v",      "libx264",
-            "-preset",   "fast",
-            "-crf",      "23",
-            "-profile:v", "high",
-            "-level:v",  "4.1",
-            "-pix_fmt",  "yuv420p",
-        ]
-
-    # ── Áudio ────────────────────────────────────────────────────────────────
-    # Regra: se o modo é 'copy' ou se o áudio já é AAC, não recodifica.
-    # Qualquer outra coisa (EAC3/DDP, AC3/DD, DTS, TrueHD) → AAC 2.0 192k.
-    if mode == "copy":
-        audio_args = ["-c:a", "copy"]
-    elif a_codec == "aac" and mode == "audio":
-        # Já é AAC — só copia. Mas se canais > 2 faz downmix para stereo.
-        if info["audio_channels"] > 2:
-            audio_args = ["-c:a", "aac", "-ac", "2", "-b:a", "192k", "-ar", "48000"]
-        else:
-            audio_args = ["-c:a", "copy"]
-    else:
-        # EAC3 / AC3 / DTS / TrueHD → AAC Stereo 2.0 192kbps
-        # -af aformat força o downmix ANTES do encoder → mais seguro que -ac 2 sozinho
-        audio_args = [
-            "-c:a", "aac", "-b:a", "192k",
-            "-ac",  "2",   "-ar",  "48000",
-            "-af",  "aresample=resampler=swr,aformat=channel_layouts=stereo",
-        ]
-
-    # ── Monta o comando FFmpeg ────────────────────────────────────────────────
-    seg_pattern = os.path.join(cache_dir, "seg%05d.ts")
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-
-        # Input — permite abrir arquivos ainda sendo baixados
-        "-fflags",       "+genpts+igndts",
-        "-analyzeduration", "10000000",   # 10s de análise (necessário para DDP)
-        "-probesize",    "10000000",
-        "-i",            os.path.normpath(file_path),
-
-        # Mapeamento explícito — vídeo e áudio, sem legendas no stream
-        "-map", "0:v:0",   # primeiro stream de vídeo
-        "-map", "0:a:0",   # primeira trilha de áudio
-
-        *video_args,
-        *audio_args,
-
-        # Container HLS
-        "-f",                "hls",
-        "-hls_time",         str(HLS_SEGMENT_SECS),
-        "-hls_list_size",    "0",
-        "-hls_flags",        "independent_segments+append_list",
-        "-hls_segment_type", "mpegts",
-        "-hls_segment_filename", seg_pattern,
-        "-start_number",     "0",
-
-        # Força timestamps corretos no TS
-        "-muxdelay",   "0",
-        "-muxpreload", "0",
-
-        m3u8_path,
-    ]
-
-    print(f"🎬 FFmpeg HLS [{mode}]")
-    print(f"   video: {v_codec} → {'copy' if mode in ('copy','audio') else 'h264'}")
-    print(f"   audio: {a_codec} → {'copy' if mode == 'copy' else 'aac_stereo'}")
-    print(f"   encoder: {encoder}")
-    print(f"   cmd: {' '.join(cmd)}")
-
-    # Coleta stderr completo para diagnóstico de erros
-    stderr_lines: List[str] = []
-    stderr_lock  = threading.Lock()
-
-    # Inicia processo em background
-    # IMPORTANTE: No Windows, CREATE_NO_WINDOW + stderr=PIPE causa WinError 6
-    # (Identificador Inválido). A solução é usar STARTUPINFO para ocultar a janela
-    # sem fechar os handles de pipe.
-    proc = _popen(cmd)
-
-    with active_streams_lock:
-        if info_hash in active_streams:
-            active_streams[info_hash].setdefault("ffmpeg_procs", []).append(proc)
-
-    def _collect_stderr(p: subprocess.Popen) -> None:
-        for raw in (p.stderr or []):
-            line = raw.decode(errors="replace").strip()
-            if line:
-                with stderr_lock:
-                    stderr_lines.append(line)
-                # Imprime no console do servidor (filtra progresso)
-                if not any(x in line for x in ("frame=", "size=", "time=", "speed=")):
-                    print(f"[ffmpeg/{mode[:4]}] {line}")
-        rc = p.wait()
-        print(f"[ffmpeg/{mode[:4]}] encerrado rc={rc}")
-
-    threading.Thread(target=_collect_stderr, args=(proc,), daemon=True).start()
-
-    def _get_ffmpeg_error() -> str:
-        """Monta mensagem de erro legível a partir do stderr coletado."""
-        with stderr_lock:
-            lines = list(stderr_lines)
-        # Filtra só linhas relevantes (erros, não progresso)
-        errors = [l for l in lines if not any(
-            x in l for x in ("frame=", "size=", "time=", "speed=", "Past duration")
-        )]
-        if not errors:
-            return "FFmpeg falhou sem mensagem de erro"
-        # Pega as últimas 5 linhas relevantes — são as mais informativas
-        snippet = " | ".join(errors[-5:])
-        return snippet[:600]
-
-    # Aguarda o primeiro segmento aparecer (até 45s)
-    seg0 = os.path.join(cache_dir, "seg00000.ts")
-    for i in range(90):
-        if os.path.exists(seg0) and os.path.getsize(seg0) > 8192:
-            print(f"✅ Primeiro segmento HLS pronto ({i*0.5:.1f}s)")
+    with hls_lock:
+        # Re-verifica dentro do lock — outra thread pode ter terminado enquanto
+        # esta aguardava, deixando o cache pronto.
+        if _is_hls_ready(cache_dir):
+            print(f"♻ HLS cache hit (post-lock): {cache_dir}")
             return m3u8_path
 
-        rc = proc.poll()
-        if rc is not None and not os.path.exists(seg0):
-            # FFmpeg morreu — extrai mensagem de erro do stderr
-            time.sleep(0.2)  # dá tempo ao _collect_stderr de capturar o resto
-            err_msg = _get_ffmpeg_error()
+        # ── FIX 1: aguarda buffer mínimo ANTES de chamar o FFmpeg ────────────
+        if not wait_for_buffer(file_path):
             raise FFmpegError(
-                code=rc,
+                code=-2,
                 mode=mode,
-                video_codec=v_codec,
-                audio_codec=a_codec,
-                encoder=encoder,
-                detail=err_msg,
+                video_codec="",
+                audio_codec="",
+                encoder="",
+                detail=(
+                    f"Arquivo ainda não disponível em disco após {BUFFER_READY_TIMEOUT_S}s. "
+                    f"Verifique conexão e seeders do torrent."
+                ),
             )
-        time.sleep(0.5)
 
-    proc.kill()
-    raise FFmpegError(
-        code=-1,
-        mode=mode,
-        video_codec=v_codec,
-        audio_codec=a_codec,
-        encoder=encoder,
-        detail="Timeout: primeiro segmento não gerado em 45s",
-    )
+        # A partir daqui o arquivo tem ≥ BUFFER_READY_BYTES → ffprobe/ffmpeg
+        # conseguem ler o cabeçalho do container sem falhar.
+        info    = _probe_streams(file_path)
+        v_codec = info["video_codec"]
+        a_codec = info["audio_codec"]
+        encoder = detect_gpu_encoder()
+
+        # ── Vídeo ─────────────────────────────────────────────────────────────
+        if mode in ("copy", "audio"):
+            video_args = ["-c:v", "copy"]
+
+        elif encoder == "h264_nvenc":
+            video_args = [
+                "-c:v", "h264_nvenc",
+                "-preset",   "p4",
+                "-rc",       "vbr",
+                "-cq",       "23",
+                "-b:v",      "0",
+                "-profile:v", "high",
+                "-level:v",  "4.1",
+                "-pix_fmt",  "yuv420p",
+            ]
+
+        elif encoder == "h264_qsv":
+            video_args = [
+                "-c:v", "h264_qsv",
+                "-global_quality", "23",
+                "-look_ahead",     "1",
+                "-profile:v",      "high",
+                "-pix_fmt",        "yuv420p",
+            ]
+
+        else:
+            video_args = [
+                "-c:v",      "libx264",
+                "-preset",   "fast",
+                "-crf",      "23",
+                "-profile:v", "high",
+                "-level:v",  "4.1",
+                "-pix_fmt",  "yuv420p",
+            ]
+
+        # ── Áudio ─────────────────────────────────────────────────────────────
+        if mode == "copy":
+            audio_args = ["-c:a", "copy"]
+        elif a_codec == "aac" and mode == "audio":
+            if info["audio_channels"] > 2:
+                audio_args = ["-c:a", "aac", "-ac", "2", "-b:a", "192k", "-ar", "48000"]
+            else:
+                audio_args = ["-c:a", "copy"]
+        else:
+            audio_args = [
+                "-c:a", "aac", "-b:a", "192k",
+                "-ac",  "2",   "-ar",  "48000",
+                "-af",  "aresample=resampler=swr,aformat=channel_layouts=stereo",
+            ]
+
+        # ── Monta o comando FFmpeg ─────────────────────────────────────────────
+        seg_pattern = os.path.join(cache_dir, "seg%05d.ts")
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-fflags",       "+genpts+igndts",
+            "-analyzeduration", "10000000",
+            "-probesize",    "10000000",
+            "-i",            os.path.normpath(file_path),
+            "-map", "0:v:0",
+            "-map", "0:a:0",
+            *video_args,
+            *audio_args,
+            "-f",                "hls",
+            "-hls_time",         str(HLS_SEGMENT_SECS),
+            "-hls_list_size",    "0",
+            "-hls_flags",        "independent_segments+append_list",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", seg_pattern,
+            "-start_number",     "0",
+            "-muxdelay",   "0",
+            "-muxpreload", "0",
+            m3u8_path,
+        ]
+
+        print(f"🎬 FFmpeg HLS [{mode}]")
+        print(f"   video: {v_codec} → {'copy' if mode in ('copy','audio') else 'h264'}")
+        print(f"   audio: {a_codec} → {'copy' if mode == 'copy' else 'aac_stereo'}")
+        print(f"   encoder: {encoder}")
+
+        stderr_lines: List[str] = []
+        stderr_lock  = threading.Lock()
+
+        proc = _popen(cmd)
+
+        with active_streams_lock:
+            if info_hash in active_streams:
+                active_streams[info_hash].setdefault("ffmpeg_procs", []).append(proc)
+
+        def _collect_stderr(p: subprocess.Popen) -> None:
+            for raw in (p.stderr or []):
+                line = raw.decode(errors="replace").strip()
+                if line:
+                    with stderr_lock:
+                        stderr_lines.append(line)
+                    if not any(x in line for x in ("frame=", "size=", "time=", "speed=")):
+                        print(f"[ffmpeg/{mode[:4]}] {line}")
+            rc = p.wait()
+            print(f"[ffmpeg/{mode[:4]}] encerrado rc={rc}")
+
+        threading.Thread(target=_collect_stderr, args=(proc,), daemon=True).start()
+
+        def _get_ffmpeg_error() -> str:
+            with stderr_lock:
+                lines = list(stderr_lines)
+            errors = [l for l in lines if not any(
+                x in l for x in ("frame=", "size=", "time=", "speed=", "Past duration")
+            )]
+            if not errors:
+                return "FFmpeg falhou sem mensagem de erro"
+            snippet = " | ".join(errors[-5:])
+            return snippet[:600]
+
+        # Aguarda o primeiro segmento aparecer (até 45s)
+        seg0 = os.path.join(cache_dir, "seg00000.ts")
+        for i in range(90):
+            if os.path.exists(seg0) and os.path.getsize(seg0) > 8192:
+                print(f"✅ Primeiro segmento HLS pronto ({i*0.5:.1f}s)")
+                return m3u8_path
+
+            rc = proc.poll()
+            if rc is not None and not os.path.exists(seg0):
+                time.sleep(0.2)
+                err_msg = _get_ffmpeg_error()
+                raise FFmpegError(
+                    code=rc,
+                    mode=mode,
+                    video_codec=v_codec,
+                    audio_codec=a_codec,
+                    encoder=encoder,
+                    detail=err_msg,
+                )
+            time.sleep(0.5)
+
+        proc.kill()
+        raise FFmpegError(
+            code=-1,
+            mode=mode,
+            video_codec=v_codec,
+            audio_codec=a_codec,
+            encoder=encoder,
+            detail="Timeout: primeiro segmento não gerado em 45s",
+        )
 
 
+# ── FIX 2: extract_subtitle_vtt – pipeline robusto SRT/ASS → WebVTT ─────────
 def extract_subtitle_vtt(info_hash: str, file_path: str, stream_index: int = 0) -> Optional[str]:
     """
-    Extrai trilha de legenda do MKV/MKV e converte para WebVTT.
-    Suporta ASS, SSA, SRT, PGS (imagem→texto não funciona sem OCR).
-    Retorna caminho do .vtt ou None se falhar.
+    Extrai trilha de legenda do container e entrega WebVTT garantido.
+
+    FIX 2 — incompatibilidade de formato:
+      O problema original era que o ffprobe detectava ASS/SSA/SRT, mas a
+      conversão poderia silenciosamente falhar ou gerar VTT malformado
+      (vírgulas nos timestamps SRT, cues sem header WEBVTT, etc.).
+
+      Pipeline novo:
+        1. Sonda o codec real da trilha — rejeita formatos gráficos (PGS/DVB)
+           que não têm representação textual sem OCR.
+        2. Para ASS/SSA: extrai para arquivo .ass temporário primeiro, depois
+           converte para VTT. FFmpeg converte ASS→VTT de forma mais confiável
+           quando o destino é especificado explicitamente.
+        3. Para SRT: extrai direto para VTT com -c:s webvtt; se o FFmpeg gerar
+           timestamps com vírgula (bug em versões antigas), aplica regex de
+           correção no texto final.
+        4. Valida o VTT gerado: deve começar com "WEBVTT" e ter tamanho > 0.
+           Se a validação falhar, tenta a rota de fallback via SRT intermediário.
+        5. Retorna None (sem lançar exceção) se nenhuma rota funcionar — permite
+           que o player continue sem legenda em vez de travar.
     """
     cache_dir = _hls_cache_dir(info_hash, "subs")
     vtt_path  = os.path.join(cache_dir, f"sub_{stream_index}.vtt")
 
     if os.path.exists(vtt_path) and os.path.getsize(vtt_path) > 0:
-        return vtt_path
+        # Revalida: garante que o arquivo em cache é VTT real
+        with open(vtt_path, "r", encoding="utf-8", errors="replace") as fh:
+            if fh.read(6).upper().startswith("WEBVTT"):
+                return vtt_path
+        os.remove(vtt_path)  # cache corrompido → extrai de novo
 
+    # ── Passo 1: Sonda a trilha ───────────────────────────────────────────────
     try:
-        # Verifica se a trilha existe e qual é o codec
         probe = _run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_streams", "-select_streams", f"s:{stream_index}", file_path],
             timeout=10,
         )
         streams = json.loads(probe.stdout).get("streams", [])
-        if not streams:
-            return None
-        sub_codec = streams[0].get("codec_name", "").lower()
+    except Exception as e:
+        print(f"extract_subtitle_vtt probe error: {e}")
+        return None
 
-        # PGS (HDMV) são imagens — não convertem para VTT sem OCR
-        if sub_codec in ("hdmv_pgs_subtitle", "dvd_subtitle", "dvbsub"):
-            print(f"⚠ Legenda {stream_index} é formato gráfico ({sub_codec}), não suportado")
-            return None
+    if not streams:
+        print(f"⚠ Trilha de legenda {stream_index} não encontrada em {os.path.basename(file_path)}")
+        return None
 
+    sub_codec = streams[0].get("codec_name", "").lower()
+
+    # Formatos gráficos (imagem bitmap) — impossível converter para texto sem OCR
+    GRAPHIC_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvbsub", "pgssub"}
+    if sub_codec in GRAPHIC_CODECS:
+        print(f"⚠ Legenda {stream_index} é formato gráfico ({sub_codec}), não suportado sem OCR")
+        return None
+
+    # ── Passo 2: Rotas de conversão por codec ─────────────────────────────────
+    def _ffmpeg_extract(extra_args: List[str], output_path: str, timeout: int = 120) -> bool:
+        """Wrapper que roda ffmpeg e retorna True se gerou arquivo válido."""
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", file_path,
             "-map", f"0:s:{stream_index}",
-            "-c:s", "webvtt",
-            "-f",   "webvtt",
-            vtt_path,
+            *extra_args,
+            output_path,
         ]
-        proc = _run(cmd, timeout=120, text=False)
-        if proc.returncode == 0 and os.path.exists(vtt_path) and os.path.getsize(vtt_path) > 0:
+        try:
+            proc = _run(cmd, timeout=timeout, text=False)
+            return proc.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        except Exception as e:
+            print(f"_ffmpeg_extract error: {e}")
+            return False
+
+    def _fix_vtt_timestamps(text: str) -> str:
+        """
+        Corrige timestamps SRT (vírgula) → VTT (ponto) e remove linhas só com dígitos.
+        Necessário para versões antigas do FFmpeg ou MKVs com legendas SRT embutidas.
+        """
+        # Substitui vírgula decimal nos timestamps: 00:01:23,456 → 00:01:23.456
+        text = re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", text)
+        # Remove linhas que são só números (índices de cue SRT)
+        text = re.sub(r"^\d+\s*$", "", text, flags=re.MULTILINE)
+        # Remove linhas em branco duplicadas
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text
+
+    def _validate_vtt(path: str) -> bool:
+        """Retorna True se o arquivo é um WebVTT válido (tem header e ao menos um cue)."""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read(512)
+            return content.upper().strip().startswith("WEBVTT") and "-->" in content
+        except Exception:
+            return False
+
+    success = False
+
+    if sub_codec in ("ass", "ssa"):
+        # Rota ASS/SSA: extrai para .ass temporário, depois converte para .vtt
+        # Essa rota é mais confiável que ASS→VTT direto em muitas versões do FFmpeg
+        ass_tmp = os.path.join(cache_dir, f"sub_{stream_index}_tmp.ass")
+
+        if _ffmpeg_extract(["-c:s", "copy"], ass_tmp):
+            success = _ffmpeg_extract(
+                ["-i", ass_tmp, "-c:s", "webvtt", "-f", "webvtt"],
+                # Nota: ffmpeg recebe o ass_tmp como -i, mas _ffmpeg_extract
+                # já passa file_path como -i. Precisamos de comando customizado:
+                [],  # placeholder — usaremos chamada direta abaixo
+                timeout=60,
+            )
+            # Chamada customizada para ASS → VTT (dois inputs não cabem no wrapper)
+            cmd_conv = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", ass_tmp,
+                "-c:s", "webvtt", "-f", "webvtt",
+                vtt_path,
+            ]
+            try:
+                proc = _run(cmd_conv, timeout=60, text=False)
+                success = (proc.returncode == 0
+                           and os.path.exists(vtt_path)
+                           and os.path.getsize(vtt_path) > 0)
+            except Exception as e:
+                print(f"ASS→VTT conv error: {e}")
+                success = False
+
+            # Limpa temporário
+            try:
+                os.remove(ass_tmp)
+            except OSError:
+                pass
+
+    if not success:
+        # Rota genérica: FFmpeg direto → WebVTT
+        success = _ffmpeg_extract(["-c:s", "webvtt", "-f", "webvtt"], vtt_path)
+
+    # ── Passo 3: Pós-processamento e validação ────────────────────────────────
+    if success and os.path.exists(vtt_path):
+        with open(vtt_path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+
+        # Garante header WEBVTT
+        if not raw.strip().upper().startswith("WEBVTT"):
+            raw = "WEBVTT\n\n" + raw
+
+        # Corrige timestamps se necessário
+        raw = _fix_vtt_timestamps(raw)
+
+        with open(vtt_path, "w", encoding="utf-8") as fh:
+            fh.write(raw)
+
+        if _validate_vtt(vtt_path):
             print(f"💬 Legenda {stream_index} ({sub_codec}) → {vtt_path}")
             return vtt_path
         else:
-            err = proc.stderr.decode(errors="replace")[:300]
-            print(f"⚠ Falha legenda {stream_index}: {err}")
-    except Exception as e:
-        print(f"extract_subtitle_vtt error: {e}")
+            print(f"⚠ VTT gerado mas inválido para legenda {stream_index} — descartado")
+            os.remove(vtt_path)
 
+    # ── Passo 4: Fallback via SRT intermediário ───────────────────────────────
+    srt_tmp = os.path.join(cache_dir, f"sub_{stream_index}_fallback.srt")
+    if _ffmpeg_extract(["-c:s", "subrip"], srt_tmp):
+        try:
+            with open(srt_tmp, "r", encoding="utf-8", errors="replace") as fh:
+                srt_text = fh.read()
+
+            # Converte SRT → VTT manualmente
+            vtt_text = "WEBVTT\n\n" + _fix_vtt_timestamps(srt_text)
+
+            with open(vtt_path, "w", encoding="utf-8") as fh:
+                fh.write(vtt_text)
+
+            if _validate_vtt(vtt_path):
+                print(f"💬 Legenda {stream_index} ({sub_codec}) via SRT fallback → {vtt_path}")
+                return vtt_path
+        except Exception as e:
+            print(f"SRT fallback error: {e}")
+        finally:
+            try:
+                os.remove(srt_tmp)
+            except OSError:
+                pass
+
+    print(f"❌ Todas as rotas falharam para legenda {stream_index} ({sub_codec})")
     return None
 
 
 def kill_ffmpeg_procs(info_hash: str) -> None:
-    """Para todos os processos FFmpeg associados ao info_hash."""
     with active_streams_lock:
         procs = active_streams.get(info_hash, {}).get("ffmpeg_procs", [])
 
@@ -1171,15 +1301,65 @@ def kill_ffmpeg_procs(info_hash: str) -> None:
             active_streams[info_hash]["ffmpeg_procs"] = []
 
 
+# ── MOTOR DE TRADUÇÃO GOOGLE ─────────────────────────────────────────────────
+def google_translate_v1(text: str, target_lang: str = "pt") -> str:
+    """
+    Traduz `text` usando o endpoint público gtx do Google Translate.
+
+    Endpoint: https://translate.googleapis.com/translate_a/single
+      client=gtx  → token público, sem API key
+      sl=auto     → detecta língua de origem automaticamente
+      tl=pt       → língua de destino (padrão português)
+      dt=t        → retorna só a tradução (sem dicionário, sem exemplos)
+
+    Linhas que NÃO devem ser traduzidas (retorna original):
+      - Vazias ou só espaços
+      - Linhas numéricas (índices de cue SRT/VTT)
+      - Timestamps ("-->")
+      - Tags HTML/VTT (<i>, <b>, etc.)
+
+    Retorna o texto original em caso de qualquer falha de rede/parse.
+    """
+    stripped = text.strip()
+    if (
+        not stripped
+        or stripped.isdigit()
+        or "-->" in stripped
+        or re.match(r"^<[^>]+>$", stripped)   # linha que é só uma tag
+    ):
+        return text
+
+    try:
+        params = {
+            "client": "gtx",
+            "sl":     "auto",
+            "tl":     target_lang,
+            "dt":     "t",
+            "q":      stripped,
+        }
+        r = http_requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params=params,
+            timeout=5,
+        )
+        if r.status_code == 200:
+            # Formato de resposta: [[[translated, original, ...], ...], ...]
+            parts = r.json()[0]
+            translated = "".join(p[0] for p in parts if p and p[0])
+            return translated if translated else text
+    except Exception as e:
+        print(f"⚠ google_translate_v1: {e}")
+
+    return text
+
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 
 @app.route("/ping")
 def ping():
-    return jsonify({"status": "online", "version": "3.0.0"})
+    return jsonify({"status": "online", "version": "3.1.0"})
 
 # ── /subtitles/proxy ──────────────────────────────────────────────────────────
-# Headers que causam problemas de CORS ou conflito quando repassados ao browser
 _BLOCKED_RESPONSE_HEADERS = {
     "access-control-allow-origin",
     "access-control-allow-methods",
@@ -1190,7 +1370,7 @@ _BLOCKED_RESPONSE_HEADERS = {
     "x-frame-options",
     "x-content-type-options",
     "strict-transport-security",
-    "transfer-encoding",   # chunked não combina com content-length fixo
+    "transfer-encoding",
     "connection",
     "keep-alive",
     "server",
@@ -1199,46 +1379,22 @@ _BLOCKED_RESPONSE_HEADERS = {
 
 @app.route("/subtitles/proxy")
 def subtitle_proxy():
-    """
-    Proxy universal para legendas e traduções — resolve todos os problemas de CORS.
-
-    Uso:
-      GET /subtitles/proxy?url=https://exemplo.com/legenda.vtt
-      GET /subtitles/proxy?url=https://translate.googleapis.com/...
-
-    Funcionalidades:
-      - Remove headers CORS do servidor remoto (causam conflito com os nossos)
-      - Adiciona Access-Control-Allow-Origin: * para o browser aceitar
-      - Detecta e converte SRT → WebVTT automaticamente
-      - Suporta JSON (Google Translate, APIs de legenda) e texto (VTT, SRT)
-      - Timeout agressivo (12s) para não travar o front
-
-    Exemplos de uso no front:
-      // Baixar VTT de servidor externo sem CORS
-      /subtitles/proxy?url=https://opensubtitles.strem.io/...
-
-      // Google Translate via gtx (sem CORS)
-      /subtitles/proxy?url=https://translate.googleapis.com/translate_a/single?client=gtx&...
-    """
     target_url = request.args.get("url", "").strip()
     if not target_url:
         return jsonify({"error": "Parâmetro 'url' é obrigatório"}), 400
 
-    # Segurança básica: só permite http/https
     if not target_url.startswith(("http://", "https://")):
         return jsonify({"error": "URL deve usar http ou https"}), 400
 
-    # Headers que imitam um browser real — essencial para Google Translate e afins
     req_headers = {
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-        "Accept-Encoding": "identity",   # sem gzip — simplifica o decode
+        "Accept-Encoding": "identity",
         "Connection":      "keep-alive",
         "Referer":         "https://web.stremio.com/",
     }
 
-    # Repassa headers do cliente que fazem sentido (Range, Accept, etc.)
     for h in ("Accept", "Accept-Language", "Range"):
         val = request.headers.get(h)
         if val:
@@ -1250,7 +1406,7 @@ def subtitle_proxy():
             headers=req_headers,
             timeout=12,
             allow_redirects=True,
-            stream=False,   # lê tudo de uma vez — necessário para conversão SRT→VTT
+            stream=False,
         )
     except http_requests.exceptions.ConnectionError:
         return jsonify({"error": "Não foi possível conectar ao servidor remoto"}), 502
@@ -1259,18 +1415,15 @@ def subtitle_proxy():
     except Exception as e:
         return jsonify({"error": f"Erro na requisição: {str(e)[:200]}"}), 502
 
-    # ── Detecta o tipo de conteúdo real ──────────────────────────────────────
     raw_content_type = resp.headers.get("Content-Type", "").lower()
     body_bytes       = resp.content
 
-    # Tenta decodificar como texto
     encoding = resp.encoding or "utf-8"
     try:
         body_text = body_bytes.decode(encoding, errors="replace")
     except Exception:
         body_text = body_bytes.decode("utf-8", errors="replace")
 
-    # ── Conversão automática SRT → WebVTT ─────────────────────────────────────
     is_vtt_request = (
         ".vtt" in target_url.lower()
         or "text/vtt" in raw_content_type
@@ -1283,13 +1436,11 @@ def subtitle_proxy():
     )
 
     if is_srt and not body_text.strip().startswith("WEBVTT"):
-        # Converte SRT → VTT: substitui vírgula por ponto nos timestamps
         body_text = "WEBVTT\n\n" + re.sub(
             r"(\d{2}:\d{2}:\d{2}),(\d{3})",
             r"\1.\2",
             body_text,
         )
-        # Remove números de sequência (linhas que são só dígitos)
         body_text = re.sub(r"^\d+$", "", body_text, flags=re.MULTILINE)
         final_content_type = "text/vtt; charset=utf-8"
         final_body = body_text.encode("utf-8")
@@ -1299,36 +1450,30 @@ def subtitle_proxy():
         final_body = body_text.encode("utf-8")
 
     elif "json" in raw_content_type or body_text.strip().startswith(("[", "{")):
-        # JSON (Google Translate, APIs de subtitle) — repassa como JSON
         final_content_type = "application/json; charset=utf-8"
         final_body = body_bytes
 
     else:
-        # Qualquer outro tipo — repassa como está
         final_content_type = raw_content_type or "text/plain; charset=utf-8"
         final_body = body_bytes
 
-    # ── Monta resposta com headers CORS corretos ──────────────────────────────
-    # Filtra headers do servidor remoto, mantém só os seguros
     safe_headers: Dict[str, str] = {}
     for key, val in resp.headers.items():
         if key.lower() not in _BLOCKED_RESPONSE_HEADERS:
             safe_headers[key] = val
 
-    # Garante que o browser aceite a resposta
     safe_headers["Access-Control-Allow-Origin"]  = "*"
     safe_headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     safe_headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
     safe_headers["Content-Type"]   = final_content_type
     safe_headers["Content-Length"] = str(len(final_body))
-    safe_headers["Cache-Control"]  = "public, max-age=300"   # 5min de cache
+    safe_headers["Cache-Control"]  = "public, max-age=300"
 
     return Response(final_body, status=resp.status_code, headers=safe_headers)
 
 
 @app.route("/subtitles/proxy", methods=["OPTIONS"])
 def subtitle_proxy_options():
-    """Responde ao preflight CORS do browser."""
     return Response("", status=204, headers={
         "Access-Control-Allow-Origin":  "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -1337,37 +1482,18 @@ def subtitle_proxy_options():
     })
 
 
-
-
-# ── /transcode/test ───────────────────────────────────────────────────────────
 @app.route("/transcode/test")
 def transcode_test():
-    """
-    Rota de diagnóstico — testa se FFmpeg está instalado e qual GPU está disponível.
-    O front-end pode chamar isso na inicialização para mostrar avisos ao usuário.
-
-    Resposta:
-      {
-        "ffmpeg_ok":   true,
-        "ffprobe_ok":  true,
-        "ffmpeg_version": "6.1",
-        "gpu_encoder": "h264_nvenc" | "h264_qsv" | "libx264",
-        "gpu_label":   "NVIDIA NVENC" | "Intel QSV" | "CPU (libx264)",
-        "issues":      []   -- lista de problemas encontrados
-      }
-    """
     issues = []
     ffmpeg_ok   = False
     ffprobe_ok  = False
     ffmpeg_ver  = ""
     gpu_encoder = ""
 
-    # Testa ffmpeg
     try:
         r = _run(["ffmpeg", "-version"], timeout=5)
         if r.returncode == 0:
             ffmpeg_ok  = True
-            # Extrai versão da primeira linha
             first_line = r.stdout.splitlines()[0] if r.stdout else ""
             import re as _re
             m = _re.search(r"ffmpeg version ([\S]+)", first_line)
@@ -1379,7 +1505,6 @@ def transcode_test():
     except Exception as e:
         issues.append(f"ffmpeg error: {e}")
 
-    # Testa ffprobe
     try:
         r = _run(["ffprobe", "-version"], timeout=5)
         ffprobe_ok = r.returncode == 0
@@ -1390,7 +1515,6 @@ def transcode_test():
     except Exception as e:
         issues.append(f"ffprobe error: {e}")
 
-    # Detecta GPU (só se ffmpeg estiver ok)
     if ffmpeg_ok:
         gpu_encoder = detect_gpu_encoder()
         if gpu_encoder == "libx264":
@@ -1416,41 +1540,8 @@ def transcode_test():
     })
 
 
-# ── /addons/search ────────────────────────────────────────────────────────────
 @app.route("/addons/search")
 def addon_search():
-    """
-    Busca streams por nome + temporada + episódio.
-    Consulta Stremio addons E Nyaa.si em paralelo.
-
-    Query params:
-      name         — nome do anime (ex: "One Piece")
-      season       — temporada (default: 1)
-      episode      — episódio (default: 1)
-      imdb_id      — (opcional) IMDB ID ex: tt0388629
-      kitsu_id     — (opcional) Kitsu ID ex: 12189
-      nyaa         — "true" | "false" (default: true) — incluir Nyaa.si
-      nyaa_trusted — "true" | "false" (default: false) — somente trusted no Nyaa
-
-    Resposta:
-      {
-        "total": 18,
-        "streams": [
-          {
-            "title":    "[SubsPlease] One Piece - 1001 (1080p)",
-            "infoHash": "abc123...",
-            "magnet":   "magnet:?xt=urn:btih:abc123",
-            "source":   "nyaa.si" | "https://torrentio.strem.fun",
-            "quality":  "1080P" | "720P" | "SD",
-            "size":     "317.2 MiB",
-            "seeders":  538,
-            "dub_type": "SUB" | "DUB" | "RAW",
-            "fileIdx":  null
-          }
-        ],
-        "meta": { name, imdb_id, kitsu_id, season, episode }
-      }
-    """
     name         = request.args.get("name", "").strip()
     season       = int(request.args.get("season", 1))
     episode      = int(request.args.get("episode", 1))
@@ -1462,7 +1553,6 @@ def addon_search():
     if not name and not imdb_id and not kitsu_id:
         return jsonify({"error": "Forneça 'name', 'imdb_id' ou 'kitsu_id'"}), 400
 
-    # Resolve IDs em paralelo se não fornecidos
     if name and (not imdb_id or not kitsu_id):
         with ThreadPoolExecutor(max_workers=2) as ex:
             fut_imdb  = ex.submit(resolve_imdb_id,  name) if not imdb_id  else None
@@ -1495,21 +1585,8 @@ def addon_search():
     })
 
 
-# ── /nyaa/search ─────────────────────────────────────────────────────────────
 @app.route("/nyaa/search")
 def nyaa_search_route():
-    """
-    Busca direta no Nyaa.si, sem Stremio addons.
-    Útil para buscar por nome exato, group release, etc.
-
-    Query params:
-      q            — keyword livre (ex: "SubsPlease One Piece 1080p")
-      episode      — número do episódio (opcional)
-      season       — temporada (opcional)
-      trusted      — "true" | "false" (default: false)
-
-    Resposta: mesma estrutura de /addons/search
-    """
     q            = request.args.get("q", "").strip()
     episode      = request.args.get("episode", type=int)
     season       = request.args.get("season",  type=int)
@@ -1522,30 +1599,8 @@ def nyaa_search_route():
     return jsonify({"total": len(streams), "streams": streams})
 
 
-# ── /addons/start ─────────────────────────────────────────────────────────────
 @app.route("/addons/start", methods=["POST"])
 def addon_start():
-    """
-    Inicia o download e devolve tudo que o player precisa em um único JSON.
-
-    Body JSON:
-      { "infoHash": "abc123", "magnet": "magnet:?xt=...", "title": "..." }
-
-    Resposta:
-      {
-        "info_hash":        "abc123...",
-        "stream_url":       "http://localhost:5000/stream/abc123",
-        "name":             "One Piece - Episode 1001.mkv",
-        "title":            "título original do stream",
-        "file_size_mb":     700.4,
-        "extension":        ".mkv",
-        "content_type":     "video/x-matroska",
-        "progress":         5.2,
-        "audio_tracks":     [...],
-        "subtitle_tracks":  [...],
-        "ffprobe_available": true
-      }
-    """
     data   = request.get_json(silent=True) or {}
     ih     = data.get("infoHash", "").strip().lower()
     magnet = data.get("magnet",   "").strip()
@@ -1564,17 +1619,13 @@ def addon_start():
 
     print(f"▶ Start: {title or info_hash}")
 
-    # Aguarda buffer mínimo (~5%) para ffprobe conseguir ler o container
-    for _ in range(120):
-        if handle.status().progress > 0.05:
-            break
-        time.sleep(1)
-
-    # Aguarda arquivo existir no disco
-    for _ in range(30):
-        if os.path.exists(file_path):
-            break
-        time.sleep(1)
+    # Aguarda buffer mínimo antes de chamar o ffprobe
+    if not wait_for_buffer(file_path):
+        return jsonify({
+            "error": "Arquivo não disponível em disco após espera máxima",
+            "stage": "buffer",
+            "hint":  "Verifique a conexão e o número de seeders do torrent",
+        }), 503
 
     tracks = get_track_info(file_path)
 
@@ -1596,15 +1647,11 @@ def addon_start():
 
     s = handle.status()
 
-    # Detecta automaticamente o modo de transcode necessário
-    transcode_mode = auto_transcode_mode(file_path)
-    print(f"🔧 Transcode mode: {transcode_mode}")
-
     resp = {
         "info_hash":        info_hash,
         "stream_url":       f"http://localhost:5000/stream/{info_hash}",
         "hls_url":          f"http://localhost:5000/hls/{info_hash}/index.m3u8",
-        "transcode_mode":   transcode_mode,   # "copy" | "audio" | "full"
+        "transcode_mode":   transcode_mode_detected,
         "name":             s.name,
         "title":            title,
         "file_size_mb":     round(file_size / 1024 / 1024, 1),
@@ -1621,13 +1668,8 @@ def addon_start():
     return jsonify(resp)
 
 
-# ── /stream/<hash> ────────────────────────────────────────────────────────────
 @app.route("/stream/<info_hash>")
 def stream_by_hash(info_hash):
-    """
-    Range-ready stream direto do arquivo (sem transcode).
-    Use quando o browser já suporta o codec (H.264 + AAC).
-    """
     info_hash = info_hash.lower()
     with active_streams_lock:
         entry = active_streams.get(info_hash)
@@ -1641,18 +1683,6 @@ def stream_by_hash(info_hash):
 # ── /hls/<hash>/index.m3u8 + segmentos ───────────────────────────────────────
 @app.route("/hls/<info_hash>/index.m3u8")
 def hls_playlist(info_hash):
-    """
-    Inicia (ou retorna do cache) o HLS transcoding e serve o .m3u8.
-
-    Query params:
-      ?mode=auto   (padrão) — detecta automaticamente o modo necessário
-      ?mode=audio  — converte só o áudio (DDP/DTS → AAC), vídeo em copy
-      ?mode=full   — converte vídeo (HEVC→H.264) + áudio
-      ?mode=copy   — remux puro, sem recodificar nada
-
-    O React deve usar esta URL no <video src> quando transcode_mode != "copy"
-    ou quando o arquivo tiver codec incompatível.
-    """
     info_hash = info_hash.lower()
     mode      = request.args.get("mode", "auto").lower()
 
@@ -1665,7 +1695,6 @@ def hls_playlist(info_hash):
     if not os.path.exists(file_path):
         return jsonify({"error": "Arquivo ainda não disponível"}), 503
 
-    # Resolve modo automático
     if mode == "auto":
         mode = auto_transcode_mode(file_path)
 
@@ -1673,7 +1702,6 @@ def hls_playlist(info_hash):
         m3u8_path = start_hls_transcode(info_hash, file_path, mode)
     except FFmpegError as e:
         err_dict = e.to_dict()
-        # Auto-retry: GPU falhou → libx264 (CPU)
         if e.encoder in ("h264_nvenc", "h264_qsv"):
             print(f"⚠ GPU {e.encoder} falhou — retry com libx264 (CPU)...")
             global _gpu_encoder
@@ -1688,12 +1716,9 @@ def hls_playlist(info_hash):
     except RuntimeError as e:
         return jsonify({"error": str(e), "hints": ["Verifique os logs do servidor"]}), 500
 
-    # Serve o .m3u8 com CORS
     with open(m3u8_path, "r") as f:
         m3u8_content = f.read()
 
-    # Reescreve URLs dos segmentos para apontar para nossa rota
-    # (FFmpeg gera caminhos locais; precisamos expor via HTTP)
     m3u8_content = re.sub(
         r"(seg\d+\.ts)",
         lambda m: f"/hls/{info_hash}/{m.group(1)}",
@@ -1712,13 +1737,8 @@ def hls_playlist(info_hash):
 
 @app.route("/hls/<info_hash>/<segment>")
 def hls_segment(info_hash, segment):
-    """
-    Serve um segmento .ts do HLS.
-    O browser/player requisita automaticamente conforme avança no vídeo.
-    """
     info_hash = info_hash.lower()
 
-    # Valida nome do segmento (apenas letras, números, underscore, ponto)
     if not re.match(r"^seg\d+\.ts$", segment):
         return jsonify({"error": "Segmento inválido"}), 400
 
@@ -1727,9 +1747,7 @@ def hls_segment(info_hash, segment):
     if not entry:
         return jsonify({"error": "Stream não encontrado"}), 404
 
-    # Procura o segmento em qualquer subpasta de cache deste hash
-    cache_base = os.path.join(HLS_CACHE_PATH, "")
-    seg_path   = None
+    seg_path = None
     for mode in ("audio", "full", "copy"):
         candidate = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}", segment)
         if os.path.exists(candidate):
@@ -1737,7 +1755,6 @@ def hls_segment(info_hash, segment):
             break
 
     if not seg_path:
-        # Segmento ainda sendo gerado — aguarda até 10s
         for _ in range(20):
             for mode in ("audio", "full", "copy"):
                 candidate = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}", segment)
@@ -1755,16 +1772,14 @@ def hls_segment(info_hash, segment):
     return stream_file_response(seg_path, file_size, "video/mp2t")
 
 
-# ── /subtitles/<hash>/<index>.vtt ────────────────────────────────────────────
+# ── FIX 2: /subtitles/<hash>/<index>.vtt ─────────────────────────────────────
 @app.route("/subtitles/<info_hash>/<int:sub_index>.vtt")
 def serve_subtitle(info_hash, sub_index):
     """
-    Extrai e serve uma trilha de legenda como WebVTT.
+    Extrai e serve uma trilha de legenda como WebVTT garantido.
 
-    Uso no React:
-      <track kind="subtitles" src="http://localhost:5000/subtitles/{hash}/0.vtt" />
-
-    sub_index: índice da trilha de legenda (0 = primeira, 1 = segunda...)
+    FIX 2: Usa o pipeline robusto de extract_subtitle_vtt que tenta
+    múltiplas rotas de conversão e valida o resultado antes de servir.
     """
     info_hash = info_hash.lower()
 
@@ -1779,7 +1794,10 @@ def serve_subtitle(info_hash, sub_index):
 
     vtt_path = extract_subtitle_vtt(info_hash, file_path, sub_index)
     if not vtt_path:
-        return jsonify({"error": f"Legenda {sub_index} não encontrada ou erro na extração"}), 404
+        return jsonify({
+            "error":  f"Legenda {sub_index} não disponível",
+            "reason": "Formato gráfico (PGS/DVB) não suportado, ou falha na extração",
+        }), 404
 
     with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
         vtt_content = f.read()
@@ -1794,13 +1812,177 @@ def serve_subtitle(info_hash, sub_index):
     )
 
 
-# ── /transcode/status/<hash> ──────────────────────────────────────────────────
+# ── /hls/select-audio/<hash> ──────────────────────────────────────────────────
+@app.route("/hls/select-audio/<info_hash>", methods=["POST"])
+def hls_select_audio(info_hash):
+    """
+    Reinicia o HLS usando uma trilha de áudio específica.
+
+    Body JSON:
+      { "audio_index": 2, "mode": "auto" }
+
+    Por que isso é necessário:
+      O FFmpeg padrão sempre usa `0:a:0` (primeira trilha). Se o anime tem
+      três áudios (JP, EN, PT-BR), o usuário fica preso no primeiro.
+      Esta rota mata o processo FFmpeg existente, limpa o cache e reinicia
+      com `-map 0:a:<audio_index>`.
+
+    Resposta:
+      { "hls_url": "...", "audio_index": 2, "mode": "audio" }
+    """
+    info_hash = info_hash.lower()
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash)
+    if not entry:
+        return jsonify({"error": "Stream não encontrado"}), 404
+
+    data        = request.get_json(silent=True) or {}
+    audio_index = data.get("audio_index", 0)
+    mode        = data.get("mode", "auto").lower()
+
+    file_path = entry["file_path"]
+    if not os.path.exists(file_path):
+        return jsonify({"error": "Arquivo ainda não disponível"}), 503
+
+    if mode == "auto":
+        mode = auto_transcode_mode(file_path)
+
+    # Mata processos FFmpeg existentes e limpa cache deste modo
+    kill_ffmpeg_procs(info_hash)
+    cache_dir = _hls_cache_dir(info_hash, mode)
+    shutil.rmtree(cache_dir, ignore_errors=True)
+
+    # Remove o lock existente para permitir nova criação
+    with _hls_start_locks_meta:
+        _hls_start_locks.pop(info_hash, None)
+
+    # Reconstrói o lock e inicia novo transcode com a trilha escolhida
+    # Para isso precisamos de um wrapper que altere o mapeamento de áudio.
+    # Solução: sobrescreve temporariamente o audio_map no active_streams.
+    with active_streams_lock:
+        active_streams[info_hash]["audio_map"] = f"0:a:{audio_index}"
+
+    try:
+        m3u8_path = _start_hls_transcode_custom_audio(info_hash, file_path, mode, audio_index)
+    except FFmpegError as e:
+        return jsonify(e.to_dict()), 500
+
+    hls_url = f"http://localhost:5000/hls/{info_hash}/index.m3u8?mode={mode}"
+    return jsonify({"hls_url": hls_url, "audio_index": audio_index, "mode": mode})
+
+
+def _start_hls_transcode_custom_audio(info_hash: str, file_path: str,
+                                       mode: str, audio_index: int) -> str:
+    """
+    Versão de start_hls_transcode que aceita audio_index arbitrário.
+    Internamente idêntica, exceto pelo `-map 0:a:<audio_index>`.
+    """
+    hls_lock  = _get_hls_lock(info_hash)
+    cache_dir = _hls_cache_dir(info_hash, mode)
+    m3u8_path = os.path.join(cache_dir, "index.m3u8")
+
+    with hls_lock:
+        if _is_hls_ready(cache_dir):
+            return m3u8_path
+
+        if not wait_for_buffer(file_path):
+            raise FFmpegError(-2, mode, "", "", "",
+                              "Buffer insuficiente para iniciar transcode com trilha de áudio")
+
+        info    = _probe_streams(file_path)
+        v_codec = info["video_codec"]
+        a_codec = info["audio_codec"]
+        encoder = detect_gpu_encoder()
+
+        if mode in ("copy", "audio"):
+            video_args = ["-c:v", "copy"]
+        elif encoder == "h264_nvenc":
+            video_args = ["-c:v","h264_nvenc","-preset","p4","-rc","vbr","-cq","23",
+                          "-b:v","0","-profile:v","high","-level:v","4.1","-pix_fmt","yuv420p"]
+        elif encoder == "h264_qsv":
+            video_args = ["-c:v","h264_qsv","-global_quality","23","-look_ahead","1",
+                          "-profile:v","high","-pix_fmt","yuv420p"]
+        else:
+            video_args = ["-c:v","libx264","-preset","fast","-crf","23",
+                          "-profile:v","high","-level:v","4.1","-pix_fmt","yuv420p"]
+
+        if mode == "copy":
+            audio_args = ["-c:a", "copy"]
+        elif a_codec == "aac" and mode == "audio" and info["audio_channels"] <= 2:
+            audio_args = ["-c:a", "copy"]
+        else:
+            audio_args = ["-c:a","aac","-b:a","192k","-ac","2","-ar","48000",
+                          "-af","aresample=resampler=swr,aformat=channel_layouts=stereo"]
+
+        seg_pattern = os.path.join(cache_dir, "seg%05d.ts")
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+genpts+igndts",
+            "-analyzeduration", "10000000",
+            "-probesize", "10000000",
+            "-i", os.path.normpath(file_path),
+            "-map", "0:v:0",
+            "-map", f"0:a:{audio_index}",   # ← trilha escolhida pelo usuário
+            *video_args,
+            *audio_args,
+            "-f", "hls",
+            "-hls_time", str(HLS_SEGMENT_SECS),
+            "-hls_list_size", "0",
+            "-hls_flags", "independent_segments+append_list",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", seg_pattern,
+            "-start_number", "0",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            m3u8_path,
+        ]
+
+        print(f"🎬 FFmpeg HLS [{mode}] audio_index={audio_index}")
+
+        stderr_lines: List[str] = []
+        stderr_lock  = threading.Lock()
+        proc = _popen(cmd)
+
+        with active_streams_lock:
+            if info_hash in active_streams:
+                active_streams[info_hash].setdefault("ffmpeg_procs", []).append(proc)
+
+        def _collect(p):
+            for raw in (p.stderr or []):
+                line = raw.decode(errors="replace").strip()
+                if line:
+                    with stderr_lock:
+                        stderr_lines.append(line)
+                    if not any(x in line for x in ("frame=", "size=", "time=", "speed=")):
+                        print(f"[ffmpeg/sel] {line}")
+            p.wait()
+
+        threading.Thread(target=_collect, args=(proc,), daemon=True).start()
+
+        seg0 = os.path.join(cache_dir, "seg00000.ts")
+        for i in range(90):
+            if os.path.exists(seg0) and os.path.getsize(seg0) > 8192:
+                return m3u8_path
+            rc = proc.poll()
+            if rc is not None and not os.path.exists(seg0):
+                time.sleep(0.2)
+                with stderr_lock:
+                    lines = list(stderr_lines)
+                errors = [l for l in lines if not any(
+                    x in l for x in ("frame=", "size=", "time=", "speed="))]
+                detail = " | ".join(errors[-5:])[:600] if errors else "FFmpeg falhou"
+                raise FFmpegError(rc, mode, v_codec, a_codec, encoder, detail)
+            time.sleep(0.5)
+
+        proc.kill()
+        raise FFmpegError(-1, mode, v_codec, a_codec, encoder,
+                          "Timeout: primeiro segmento não gerado em 45s")
+
+
 @app.route("/transcode/status/<info_hash>")
 def transcode_status(info_hash):
-    """
-    Retorna quantos segmentos HLS já foram gerados e se o FFmpeg ainda está rodando.
-    O React pode usar para mostrar uma barra de progresso de transcode.
-    """
     info_hash = info_hash.lower()
 
     with active_streams_lock:
@@ -1809,7 +1991,6 @@ def transcode_status(info_hash):
 
     running = any(p.poll() is None for p in procs)
 
-    # Conta segmentos em qualquer modo de cache
     segments = 0
     for mode in ("audio", "full", "copy"):
         d = os.path.join(HLS_CACHE_PATH, f"{info_hash[:16]}_{mode}")
@@ -1818,21 +1999,15 @@ def transcode_status(info_hash):
             break
 
     return jsonify({
-        "info_hash":   info_hash,
-        "running":     running,
-        "segments":    segments,
-        "seconds_ready": segments * HLS_SEGMENT_SECS,
+        "info_hash":      info_hash,
+        "running":        running,
+        "segments":       segments,
+        "seconds_ready":  segments * HLS_SEGMENT_SECS,
     })
 
 
-# ── /status ───────────────────────────────────────────────────────────────────
 @app.route("/status")
 def status():
-    """
-    Status detalhado com buffer_health, is_header_ready e bitrate_estimate.
-    O front-end usa is_header_ready para saber quando dar play,
-    e buffer_health para mostrar quantos segundos de HLS estão prontos.
-    """
     result = []
     for h in ses.get_torrents():
         s  = h.status()
@@ -1844,7 +2019,6 @@ def status():
         file_path = entry.get("file_path", "")
         file_size = entry.get("file_size", 0)
 
-        # is_header_ready: arquivo existe e tem pelo menos 5MB no disco
         is_header_ready = False
         if file_path and os.path.exists(file_path):
             try:
@@ -1853,7 +2027,6 @@ def status():
             except OSError:
                 pass
 
-        # buffer_health: segmentos HLS já gerados × duração de cada um
         buffer_health = 0
         for m in ("audio", "full", "copy"):
             d = os.path.join(HLS_CACHE_PATH, f"{ih[:16]}_{m}")
@@ -1862,7 +2035,6 @@ def status():
                 buffer_health = segs * HLS_SEGMENT_SECS
                 break
 
-        # bitrate_estimate kbps: tamanho / duração assumida (2h fallback)
         bitrate_kbps = int((file_size * 8) / 7200 / 1000) if file_size > 0 else 0
 
         result.append({
@@ -1894,7 +2066,6 @@ def status():
     })
 
 
-# ── /stop ─────────────────────────────────────────────────────────────────────
 @app.route("/stop", methods=["POST"])
 def stop_torrent():
     data      = request.get_json(silent=True) or {}
@@ -1907,6 +2078,9 @@ def stop_torrent():
 
     if entry:
         kill_ffmpeg_procs(info_hash)
+        # Limpa o lock deste hash também
+        with _hls_start_locks_meta:
+            _hls_start_locks.pop(info_hash, None)
         threading.Thread(
             target=cleanup_torrent,
             args=(entry["handle"], entry["file_path"]),
@@ -1922,7 +2096,6 @@ def stop_torrent():
     return jsonify({"error": "Torrent não encontrado"}), 404
 
 
-# ── /play (legado) ────────────────────────────────────────────────────────────
 @app.route("/play")
 def play():
     magnet = request.args.get("magnet", "").strip()
@@ -1933,15 +2106,228 @@ def play():
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 504
 
-    for _ in range(120):
-        if handle.status().progress > 0.05:
-            break
-        time.sleep(1)
+    # Garante buffer antes de abrir o stream
+    wait_for_buffer(file_path)
 
     return stream_file_response(file_path, file_size, content_type)
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ── /search (alias simplificado de /addons/search) ────────────────────────────
+@app.route("/search")
+def api_search():
+    """
+    Alias simplificado de /addons/search para compatibilidade com front-ends
+    que não usam os parâmetros opcionais de ID (imdb_id, kitsu_id).
+
+    Query params: name, season (default 1), episode (default 1),
+                  nyaa (default true), nyaa_trusted (default false)
+    """
+    name    = request.args.get("name", "").strip()
+    season  = int(request.args.get("season",  1))
+    episode = int(request.args.get("episode", 1))
+
+    if not name:
+        return jsonify({"error": "Parâmetro 'name' é obrigatório"}), 400
+
+    use_nyaa     = request.args.get("nyaa", "true").lower() != "false"
+    nyaa_trusted = request.args.get("nyaa_trusted", "false").lower() == "true"
+
+    # Resolve IDs em paralelo (melhora os resultados do Stremio)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_imdb  = ex.submit(resolve_imdb_id,  name)
+        fut_kitsu = ex.submit(resolve_kitsu_id, name)
+        imdb_id   = fut_imdb.result()
+        kitsu_id  = fut_kitsu.result()
+
+    streams = search_all_sources(
+        name=name, season=season, episode=episode,
+        imdb_id=imdb_id, kitsu_id=kitsu_id,
+        use_nyaa=use_nyaa, nyaa_trusted=nyaa_trusted,
+    )
+    return jsonify({"total": len(streams), "streams": streams})
+
+
+# ── /tracks/<hash> ────────────────────────────────────────────────────────────
+@app.route("/tracks/<info_hash>")
+def api_tracks(info_hash):
+    """
+    Retorna as trilhas de áudio e legenda disponíveis no arquivo do torrent.
+    O front-end usa isso para popular os seletores de idioma no player.
+
+    Resposta:
+      {
+        "audio_tracks":    [{index, language, title, codec, channel_label, ...}],
+        "subtitle_tracks": [{index, language, title, codec, is_default, ...}],
+        "ffprobe_available": true
+      }
+    """
+    info_hash = info_hash.lower()
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash)
+    if not entry:
+        return jsonify({"error": "Stream não encontrado"}), 404
+
+    file_path = entry["file_path"]
+    if not os.path.exists(file_path):
+        return jsonify({"error": "Arquivo ainda não disponível no disco"}), 503
+
+    # Usa track_info em cache se já foi calculado pelo /addons/start
+    cached = entry.get("track_info")
+    if cached and cached.get("ffprobe_available"):
+        return jsonify({
+            "audio_tracks":      cached.get("audio_tracks", []),
+            "subtitle_tracks":   cached.get("subtitle_tracks", []),
+            "ffprobe_available": True,
+        })
+
+    info = get_track_info(file_path)
+
+    # Armazena no cache para próximas chamadas
+    with active_streams_lock:
+        if info_hash in active_streams:
+            if not active_streams[info_hash].get("track_info"):
+                active_streams[info_hash]["track_info"] = info
+
+    return jsonify(info)
+
+
+# ── /translate-sub/<hash>/<track_idx> ─────────────────────────────────────────
+@app.route("/translate-sub/<info_hash>/<int:track_idx>")
+def translate_sub_endpoint(info_hash, track_idx):
+    """
+    Extrai uma trilha de legenda, traduz linha por linha via Google Translate
+    e devolve WebVTT pronto para o Artplayer/HLS.js.
+
+    Por que não usa _run() com stdout "pipe:1":
+      O _run() interno usa capture_output=True, que não é compatível com
+      stdout=PIPE+stderr=PIPE no mesmo processo em todos os sistemas.
+      A solução correta é extrair para arquivo temporário e ler depois —
+      evita deadlock de pipe e o WinError 6 do Windows.
+
+    Query params:
+      ?lang=pt   (default) — idioma destino da tradução
+      ?cache=1   (default) — reaproveita VTT já traduzido se existir
+
+    Resposta: text/vtt com todas as linhas de diálogo traduzidas.
+    """
+    info_hash = info_hash.lower()
+
+    with active_streams_lock:
+        entry = active_streams.get(info_hash)
+    if not entry:
+        return jsonify({"error": "Stream não encontrado"}), 404
+
+    file_path = entry["file_path"]
+    if not os.path.exists(file_path):
+        return jsonify({"error": "Arquivo ainda não disponível no disco"}), 503
+
+    target_lang = request.args.get("lang", "pt").strip().lower()
+    use_cache   = request.args.get("cache", "1") != "0"
+
+    # ── Cache: se já traduzimos essa trilha, devolve direto ──────────────────
+    cache_dir   = _hls_cache_dir(info_hash, "subs")
+    cached_path = os.path.join(cache_dir, f"translated_{track_idx}_{target_lang}.vtt")
+
+    if use_cache and os.path.exists(cached_path) and os.path.getsize(cached_path) > 0:
+        with open(cached_path, "r", encoding="utf-8") as fh:
+            return Response(fh.read(), mimetype="text/vtt", headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "max-age=3600",
+            })
+
+    # ── Passo 1: Verifica se a trilha existe e qual é o codec ────────────────
+    try:
+        probe = _run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", f"s:{track_idx}", file_path],
+            timeout=10,
+        )
+        sub_streams = json.loads(probe.stdout).get("streams", [])
+    except Exception as e:
+        return jsonify({"error": f"ffprobe falhou: {e}"}), 500
+
+    if not sub_streams:
+        return jsonify({"error": f"Trilha de legenda {track_idx} não encontrada"}), 404
+
+    sub_codec = sub_streams[0].get("codec_name", "").lower()
+
+    # Formatos gráficos não têm texto para traduzir
+    if sub_codec in ("hdmv_pgs_subtitle", "dvd_subtitle", "dvbsub", "pgssub"):
+        return jsonify({
+            "error": f"Legenda {track_idx} é formato gráfico ({sub_codec}), não traduzível",
+        }), 422
+
+    # ── Passo 2: Extrai para SRT temporário (arquivo, não pipe) ─────────────
+    # Usar pipe:1 com _run() causa deadlock quando o ffmpeg escreve muitos dados.
+    # Arquivo temporário é seguro em todos os sistemas.
+    srt_tmp = os.path.join(cache_dir, f"raw_{track_idx}.srt")
+
+    proc = _run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-i", file_path,
+         "-map", f"0:s:{track_idx}",
+         "-c:s", "subrip",
+         "-y", srt_tmp],
+        timeout=120,
+        text=False,
+    )
+
+    if proc.returncode != 0 or not os.path.exists(srt_tmp):
+        err = (proc.stderr or b"").decode(errors="replace")[:300]
+        return jsonify({"error": "Falha ao extrair legenda", "detail": err}), 500
+
+    # ── Passo 3: Lê SRT, traduz linha por linha, converte para VTT ──────────
+    with open(srt_tmp, "r", encoding="utf-8", errors="replace") as fh:
+        raw_lines = fh.readlines()
+
+    vtt_lines = ["WEBVTT\n", "\n"]
+
+    for line in raw_lines:
+        stripped = line.rstrip("\n")
+
+        if "-->" in stripped:
+            # Timestamp: converte vírgula SRT → ponto VTT
+            vtt_lines.append(
+                re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", stripped) + "\n"
+            )
+        elif stripped.strip().isdigit():
+            # Número de sequência — omite (VTT não usa índices obrigatórios)
+            pass
+        elif not stripped.strip():
+            # Linha em branco (separador de cue)
+            vtt_lines.append("\n")
+        else:
+            # Linha de diálogo — traduz
+            translated = google_translate_v1(stripped, target_lang=target_lang)
+            vtt_lines.append(translated + "\n")
+
+    vtt_content = "".join(vtt_lines)
+
+    # ── Passo 4: Salva cache e devolve ───────────────────────────────────────
+    try:
+        with open(cached_path, "w", encoding="utf-8") as fh:
+            fh.write(vtt_content)
+    except OSError as e:
+        print(f"⚠ translate-sub: não foi possível salvar cache: {e}")
+
+    # Limpa SRT temporário
+    try:
+        os.remove(srt_tmp)
+    except OSError:
+        pass
+
+    return Response(
+        vtt_content,
+        mimetype="text/vtt",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "max-age=3600",
+        },
+    )
+
+
+# ── /play (legado) ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     result = show_config_window()
     if not result.get("start"):
@@ -1950,7 +2336,6 @@ if __name__ == "__main__":
     DOWNLOAD_PATH = result["path"]
     IS_TEMPORARY  = result["temporary"]
 
-    # Cria pasta de cache de transcode HLS
     HLS_CACHE_PATH = os.path.join(DOWNLOAD_PATH, ".hls_cache")
     os.makedirs(HLS_CACHE_PATH, exist_ok=True)
 
