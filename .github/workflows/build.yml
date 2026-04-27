@@ -1,4 +1,4 @@
-name: Build Windows EXE (Nuitka) - v6 (Based on Original)
+name: Build Windows EXE (Nuitka) - RESTAURADO
 
 on:
   push:
@@ -39,6 +39,8 @@ jobs:
             ordered-set `
             zstandard
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
+          python -c "import requests;   print('requests   OK:', requests.__version__)"
+          python -c "import nyaapy;     print('nyaapy     OK')"
 
       - name: Compilar com Nuitka
         run: |
@@ -53,12 +55,7 @@ jobs:
             "--enable-plugin=tk-inter",
             "--output-filename=torrent_stream.exe",
 
-            # ── INCLUSÃO DE MÓDULOS MODULARES (NOVO) ────────────────────────
-            "--include-package=core",
-            "--include-package=engines",
-            "--follow-imports",
-
-            # Flask stack (Igual ao seu original)
+            # Flask stack
             "--include-package=flask",
             "--include-package=flask_cors",
             "--include-package=werkzeug",
@@ -67,7 +64,7 @@ jobs:
             "--include-package=itsdangerous",
             "--include-package=markupsafe",
 
-            # HTTP + scraping (Igual ao seu original)
+            # HTTP + scraping
             "--include-package=requests",
             "--include-package=urllib3",
             "--include-package=certifi",
@@ -76,11 +73,14 @@ jobs:
             "--include-package=bs4",
             "--include-package=nyaapy",
 
-            # libtorrent native extension (Igual ao seu original)
+            # NOVOS MÓDULOS (Ajuste mínimo necessário)
+            "--include-package=core",
+            "--include-package=engines",
+            "--follow-imports",
+
+            # libtorrent native extension (Sua configuração original)
             "--include-data-files=$lt_file=libtorrent.pyd",
 
-            # ── MODO DE CONSOLE (O SEGREDO) ──────────────────────────────────
-            # Restaurado para 'attach' como no seu original que funcionava
             "--windows-console-mode=attach"
           )
 
@@ -89,9 +89,8 @@ jobs:
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
-          # Ponto de entrada (Ajustado para main.py da versão modular)
+          # Ponto de entrada (main.py é o novo arquivo com a GUI original)
           $nuitka_args += "main.py"
-          
           python @nuitka_args
 
       - name: Verificar EXE gerado
@@ -107,6 +106,6 @@ jobs:
       - name: Upload do EXE
         uses: actions/upload-artifact@v4
         with:
-          name: torrent_stream_windows_v6
+          name: torrent_stream_windows
           path: torrent_stream.exe
           retention-days: 30
