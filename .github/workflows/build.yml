@@ -42,7 +42,7 @@ jobs:
           python -c "import requests;   print('requests   OK:', requests.__version__)"
           python -c "import nyaapy;     print('nyaapy     OK')"
           python -c "import flask;      print('flask      OK')"
-          
+
       - name: Compilar com Nuitka
         run: |
           $lt_file = python -c "import libtorrent; print(libtorrent.__file__)"
@@ -102,7 +102,7 @@ jobs:
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
-          $nuitka_args += "torrent_stream.py"
+          $nuitka_args += "main.py"
           python @nuitka_args
 
       - name: Verificar EXE gerado
