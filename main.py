@@ -1,15 +1,15 @@
-import threading
 import sys
 import os
-import json
+import threading
 import time
 import shutil
+import json
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
+# Importações dos módulos locais
 import config
 from core.torrent import ses, active_streams, active_streams_lock, bootstrap_magnet, wait_for_buffer
 from core.ffmpeg import start_hls_transcode, kill_ffmpeg_procs
@@ -22,7 +22,6 @@ app = Flask(__name__)
 CORS(app)
 
 # ── LÓGICA DE LIMPEZA AUTOMÁTICA ───────────────────────────────────────────
-
 cleanup_interval_hours = 2
 last_cleanup_time = time.time()
 
@@ -32,6 +31,7 @@ def auto_cleanup_worker():
         try:
             current_time = time.time()
             if current_time - last_cleanup_time >= (cleanup_interval_hours * 3600):
+                # Limpa cache HLS
                 if config.HLS_CACHE_PATH and os.path.exists(config.HLS_CACHE_PATH):
                     for item in os.listdir(config.HLS_CACHE_PATH):
                         item_path = os.path.join(config.HLS_CACHE_PATH, item)
@@ -40,6 +40,7 @@ def auto_cleanup_worker():
                             else: os.remove(item_path)
                         except Exception: pass
                 
+                # Limpa downloads antigos
                 if config.DOWNLOAD_PATH and os.path.exists(config.DOWNLOAD_PATH):
                     for item in os.listdir(config.DOWNLOAD_PATH):
                         if item == "hls_cache": continue
@@ -55,9 +56,8 @@ def auto_cleanup_worker():
         time.sleep(300)
 
 # ── ROTAS FLASK ─────────────────────────────────────────────────────────────
-
 @app.route("/status")
-def status():
+def status_api():
     return jsonify({
         "status": "online", 
         "torrents": len(active_streams),
@@ -99,158 +99,166 @@ def cast_play():
         url = f"http://{request.host.split(':')[0]}:5000{url}"
     return jsonify({"success": cast_manager.play_on_device(device_ip, url)})
 
-# ── INTERFACE GRÁFICA (TKINTER) ──────────────────────────────────────────────
+# ── INTERFACE VISUAL ORIGINAL (RESTAURADA) ───────────────────────────────────
 
-class TorrentStreamGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("TorrentStream Server Control")
-        self.root.geometry("700x650")
-        
-        # Notebook para abas
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Aba Principal
-        self.tab_main = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_main, text="Geral")
-        self.setup_main_tab()
-        
-        # Aba de Addons
-        self.tab_addons = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_addons, text="Stremio Addons")
-        self.setup_addons_tab()
+def show_config_window() -> dict:
+    root = tk.Tk()
+    root.title("TorrentStream – Configuração")
+    root.geometry("520x450")
+    root.resizable(False, False)
+    root.configure(bg="#1e1e2e")
 
-        self.update_gui()
+    selected_path = tk.StringVar(value=config.DOWNLOAD_PATH or os.path.join(os.path.expanduser("~"), "Downloads", "TorrentStream"))
+    temp_var      = tk.BooleanVar(value=True)
+    result        = {"start": False}
 
-    def setup_main_tab(self):
-        frame = ttk.Frame(self.tab_main, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
-        
-        ttk.Label(frame, text="TorrentStream Engine", font=("Helvetica", 16, "bold")).pack(pady=10)
-        self.status_label = ttk.Label(frame, text="Servidor: Online (Porta 5000)", foreground="green")
-        self.status_label.pack(pady=5)
-        
-        # Pasta
-        folder_frame = ttk.LabelFrame(frame, text="Pasta de Arquivos Temporários", padding=10)
-        folder_frame.pack(fill=tk.X, pady=10)
-        self.path_var = tk.StringVar(value=config.DOWNLOAD_PATH)
-        ttk.Label(folder_frame, textvariable=self.path_var, wraplength=500).pack(side=tk.LEFT, padx=5)
-        ttk.Button(folder_frame, text="Selecionar", command=self.change_folder).pack(side=tk.RIGHT)
-        
-        # Limpeza
-        cleanup_frame = ttk.LabelFrame(frame, text="Limpeza Automática", padding=10)
-        cleanup_frame.pack(fill=tk.X, pady=10)
-        ttk.Label(cleanup_frame, text="Intervalo (horas):").pack(side=tk.LEFT, padx=5)
-        self.hours_var = tk.StringVar(value="2")
-        ttk.Spinbox(cleanup_frame, from_=2, to=72, width=5, textvariable=self.hours_var, command=self.update_cleanup_interval).pack(side=tk.LEFT, padx=5)
-        self.next_cleanup_label = ttk.Label(cleanup_frame, text="Próxima em: -- min", foreground="blue")
-        self.next_cleanup_label.pack(side=tk.RIGHT, padx=5)
-        
-        # Torrents
-        list_frame = ttk.LabelFrame(frame, text="Torrents Ativos", padding=10)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-        self.tree = ttk.Treeview(list_frame, columns=("Hash", "Status"), show="headings", height=5)
-        self.tree.heading("Hash", text="Info Hash")
-        self.tree.heading("Status", text="Status")
-        self.tree.pack(fill=tk.BOTH, expand=True)
+    tk.Label(root, text="🎬 TorrentStream", font=("Segoe UI", 18, "bold"),
+             bg="#1e1e2e", fg="#cdd6f4").pack(pady=(20, 4))
+    tk.Label(root, text="Servidor de streaming via torrent",
+             font=("Segoe UI", 10), bg="#1e1e2e", fg="#a6adc8").pack()
 
-    def setup_addons_tab(self):
-        frame = ttk.Frame(self.tab_addons, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
-        
-        ttk.Label(frame, text="Gerenciar Addons do Stremio", font=("Helvetica", 12, "bold")).pack(pady=10)
-        
-        # Lista de Addons
-        list_frame = ttk.Frame(frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.addon_listbox = tk.Listbox(list_frame, height=10)
-        self.addon_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.addon_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.addon_listbox.config(yscrollcommand=scrollbar.set)
-        
-        # Carregar addons iniciais
-        for addon in config.STREMIO_ADDONS:
-            self.addon_listbox.insert(tk.END, addon)
-            
-        # Controles
-        ctrl_frame = ttk.Frame(frame, padding=10)
-        ctrl_frame.pack(fill=tk.X)
-        
-        self.new_addon_var = tk.StringVar()
-        ttk.Entry(ctrl_frame, textvariable=self.new_addon_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(ctrl_frame, text="Adicionar URL", command=self.add_addon).pack(side=tk.LEFT, padx=5)
-        ttk.Button(ctrl_frame, text="Remover Selecionado", command=self.remove_addon).pack(side=tk.LEFT, padx=5)
+    # Opção de Pasta Temporária
+    chk_frame = tk.Frame(root, bg="#1e1e2e")
+    chk_frame.pack(anchor="w", padx=30, pady=(16, 0))
+    tk.Checkbutton(
+        chk_frame,
+        text="Usar pasta temporária (deletar arquivos ao fechar)",
+        variable=temp_var, bg="#1e1e2e", fg="#a6e3a1", selectcolor="#313244",
+        activebackground="#1e1e2e", activeforeground="#a6e3a1",
+        font=("Segoe UI", 9), cursor="hand2",
+    ).pack()
 
-    def add_addon(self):
-        url = self.new_addon_var.get().strip()
-        if url and url.startswith("http"):
-            if url not in config.STREMIO_ADDONS:
-                config.STREMIO_ADDONS.append(url)
-                self.addon_listbox.insert(tk.END, url)
-                config.save_settings(addons=config.STREMIO_ADDONS)
-                self.new_addon_var.set("")
-            else:
-                messagebox.showwarning("Aviso", "Esta URL já existe.")
-        else:
-            messagebox.showerror("Erro", "Insira uma URL válida (começando com http).")
+    # Seleção de Pasta
+    tk.Label(root, text="Pasta para os arquivos:",
+             font=("Segoe UI", 10), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w", padx=30, pady=(12, 4))
+    
+    frame = tk.Frame(root, bg="#1e1e2e")
+    frame.pack(fill="x", padx=30)
+    entry = tk.Entry(frame, textvariable=selected_path, font=("Segoe UI", 9),
+                     bg="#313244", fg="#cdd6f4", insertbackground="white",
+                     relief="flat", bd=6)
+    entry.pack(side="left", fill="x", expand=True)
 
-    def remove_addon(self):
-        selection = self.addon_listbox.curselection()
-        if selection:
-            idx = selection[0]
-            url = self.addon_listbox.get(idx)
-            config.STREMIO_ADDONS.remove(url)
-            self.addon_listbox.delete(idx)
-            config.save_settings(addons=config.STREMIO_ADDONS)
-        else:
-            messagebox.showwarning("Aviso", "Selecione um addon para remover.")
+    def browse():
+        p = filedialog.askdirectory(title="Escolha a pasta de download")
+        if p: selected_path.set(p)
 
-    def change_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            config.DOWNLOAD_PATH = folder
-            self.path_var.set(folder)
-            config.HLS_CACHE_PATH = os.path.join(folder, "hls_cache")
-            os.makedirs(config.HLS_CACHE_PATH, exist_ok=True)
-            config.save_settings(download_path=folder)
+    tk.Button(frame, text="📂", command=browse, bg="#45475a", fg="#cdd6f4",
+              relief="flat", font=("Segoe UI", 10), cursor="hand2",
+              padx=8).pack(side="left", padx=(6, 0))
 
-    def update_cleanup_interval(self):
+    # NOVO: Controle de Limpeza Automática
+    tk.Label(root, text="Limpeza automática (mínimo 2h):",
+             font=("Segoe UI", 10), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w", padx=30, pady=(12, 4))
+    
+    clean_frame = tk.Frame(root, bg="#1e1e2e")
+    clean_frame.pack(fill="x", padx=30)
+    hours_var = tk.StringVar(value="2")
+    tk.Spinbox(clean_frame, from_=2, to=72, textvariable=hours_var, font=("Segoe UI", 9),
+               bg="#313244", fg="#cdd6f4", buttonbackground="#45475a", relief="flat", width=10).pack(side="left")
+    tk.Label(clean_frame, text="horas", bg="#1e1e2e", fg="#a6adc8", font=("Segoe UI", 9)).pack(side="left", padx=5)
+
+    tk.Label(root,
+             text="⚠ Modo temporário: cria subpasta '.torrentstream_temp' e deleta ao fechar.",
+             font=("Segoe UI", 8), bg="#1e1e2e", fg="#6c7086", wraplength=460,
+             ).pack(anchor="w", padx=30, pady=(10, 0))
+
+    # Botões de Ação
+    btn_frame = tk.Frame(root, bg="#1e1e2e")
+    btn_frame.pack(pady=25)
+
+    def start():
         global cleanup_interval_hours
+        base = selected_path.get().strip()
+        if not base:
+            messagebox.showwarning("Atenção", "Escolha uma pasta.")
+            return
+        
         try:
-            val = int(self.hours_var.get())
-            if val < 2: val = 2
-            cleanup_interval_hours = val
-        except ValueError: pass
+            val = int(hours_var.get())
+            cleanup_interval_hours = max(2, val)
+        except: pass
 
-    def update_gui(self):
-        remaining_sec = (cleanup_interval_hours * 3600) - (time.time() - last_cleanup_time)
-        remaining_min = max(0, int(remaining_sec // 60))
-        self.next_cleanup_label.config(text=f"Próxima em: {remaining_min} min")
+        path = os.path.join(base, ".torrentstream_temp") if temp_var.get() else base
+        config.DOWNLOAD_PATH = path
+        config.IS_TEMPORARY = temp_var.get()
+        config.HLS_CACHE_PATH = os.path.join(path, "hls_cache")
         
-        for item in self.tree.get_children(): self.tree.delete(item)
-        with active_streams_lock:
-            for ih in active_streams.keys():
-                self.tree.insert("", tk.END, values=(ih[:20], "Ativo"))
+        os.makedirs(path, exist_ok=True)
+        os.makedirs(config.HLS_CACHE_PATH, exist_ok=True)
         
-        self.root.after(10000, self.update_gui)
+        config.save_settings(download_path=base)
+        result.update({"start": True})
+        root.destroy()
+
+    tk.Button(btn_frame, text="▶  Iniciar Servidor", command=start,
+              bg="#89b4fa", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+              relief="flat", cursor="hand2", padx=20, pady=8).pack(side="left", padx=8)
+
+    root.mainloop()
+    return result
+
+def run_tray(stop_event: threading.Event) -> None:
+    try:
+        import pystray
+        from PIL import Image as PILImage
+
+        img = PILImage.new("RGB", (64, 64), color=(30, 30, 80))
+
+        def on_open_folder(icon, item):
+            if os.path.exists(config.DOWNLOAD_PATH):
+                os.startfile(config.DOWNLOAD_PATH)
+
+        def on_status(icon, item):
+            with active_streams_lock:
+                if not active_streams:
+                    messagebox.showinfo("Status", "Nenhum torrent ativo.")
+                else:
+                    lines = []
+                    for ih, entry in active_streams.items():
+                        handle = entry.get("handle")
+                        if handle:
+                            s = handle.status()
+                            lines.append(f"{s.name}\n  {s.progress*100:.1f}% — {s.download_rate/1024:.0f} KB/s")
+                    messagebox.showinfo("Torrents ativos", "\n\n".join(lines) if lines else "Nenhum torrent ativo.")
+
+        def on_quit(icon, item):
+            icon.stop()
+            if config.IS_TEMPORARY and os.path.exists(config.DOWNLOAD_PATH):
+                shutil.rmtree(config.DOWNLOAD_PATH, ignore_errors=True)
+            stop_event.set()
+            os._exit(0)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("🎬 TorrentStream", None, enabled=False),
+            pystray.MenuItem(f"📁 Abrir Pasta", on_open_folder),
+            pystray.MenuItem("📊 Status", on_status),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("⏹ Parar", on_quit),
+        )
+        pystray.Icon("TorrentStream", img, "TorrentStream", menu).run()
+
+    except ImportError:
+        stop_event.wait()
 
 def run_flask():
     app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
 
 if __name__ == "__main__":
-    if not config.DOWNLOAD_PATH:
-        config.DOWNLOAD_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "TorrentStream")
-    os.makedirs(config.DOWNLOAD_PATH, exist_ok=True)
-    config.HLS_CACHE_PATH = os.path.join(config.DOWNLOAD_PATH, "hls_cache")
-    os.makedirs(config.HLS_CACHE_PATH, exist_ok=True)
+    # 1. Mostra a janela de configuração original
+    res = show_config_window()
+    if not res.get("start"):
+        sys.exit(0)
 
+    # 2. Inicia os serviços em background
+    stop_event = threading.Event()
+    
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=auto_cleanup_worker, daemon=True).start()
+    threading.Thread(target=run_tray, args=(stop_event,), daemon=True).start()
     
-    root = tk.Tk()
-    gui = TorrentStreamGUI(root)
-    root.mainloop()
+    print(f"🚀 Servidor rodando em http://0.0.0.0:5000")
+    print(f"📁 Pasta: {config.DOWNLOAD_PATH}")
+    
+    # 3. Mantém o processo vivo até o tray fechar
+    stop_event.wait()
