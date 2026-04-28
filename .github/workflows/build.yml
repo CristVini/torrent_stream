@@ -26,13 +26,11 @@ jobs:
         run: |
           pip install `
             libtorrent `
-            libtorrent-windows-dll `
             flask `
             flask-cors `
             requests `
             nyaapy `
             beautifulsoup4 `
-            ffmpeg-python `
             pystray `
             pillow `
             nuitka `
@@ -43,10 +41,29 @@ jobs:
           python -c "import nyaapy;     print('nyaapy     OK')"
           python -c "import flask;      print('flask      OK')"
 
+      - name: Localizar libtorrent .pyd
+        id: lt_path
+        run: |
+          # Encontra o .pyd real do libtorrent (pode ser __init__.pyd ou libtorrent.pyd)
+          $lt_file = python -c "
+          import importlib.util, os, glob, libtorrent
+          pkg_dir = os.path.dirname(libtorrent.__file__)
+          # Tenta o __file__ direto primeiro
+          f = libtorrent.__file__
+          if os.path.exists(f):
+              print(f)
+          else:
+              # Fallback: qualquer .pyd na pasta do pacote
+              pdys = glob.glob(os.path.join(pkg_dir, '*.pyd'))
+              print(pdys[0] if pdys else '')
+          "
+          Write-Host "libtorrent pyd: $lt_file"
+          echo "LT_FILE=$lt_file" >> $env:GITHUB_OUTPUT
+
       - name: Compilar com Nuitka
         run: |
-          $lt_file = python -c "import libtorrent; print(libtorrent.__file__)"
-          Write-Host "libtorrent file: $lt_file"
+          $lt_file = "${{ steps.lt_path.outputs.LT_FILE }}"
+          Write-Host "Usando libtorrent: $lt_file"
 
           $nuitka_args = @(
             "-m", "nuitka",
@@ -56,24 +73,24 @@ jobs:
             "--enable-plugin=tk-inter",
             "--output-filename=torrent_stream.exe",
 
-            # ── MODULARIZAÇÃO E NOVOS MÓDULOS ────────────────────────────────
-            # Inclui as pastas de lógica e motores de busca
-            "--include-package=core",
-            "--include-package=engines",
-            
-            # Garante que o Nuitka siga os imports do dlnap.py e cast.py
-            "--follow-imports",
+            # ── ARQUIVO ÚNICO: sem pastas core/ ou engines/ ───────────────────
+            # Todos os módulos estão embutidos em torrent_stream.py.
+            # Não usar --include-package=core nem --include-package=engines.
 
-            # ── DEPENDÊNCIAS DE REDE (DLNA) ──────────────────────────────────
-            # O dlnap usa sockets e servidores HTTP internos, garantimos que
-            # os módulos padrão de rede do Python estejam presentes.
+            # ── STDLIB DE REDE (usada pelo DLNA/UPnP integrado) ──────────────
             "--include-module=socket",
             "--include-module=select",
+            "--include-module=socketserver",
             "--include-module=http.server",
             "--include-module=urllib.request",
+            "--include-module=urllib.parse",
             "--include-module=xml.etree.ElementTree",
+            "--include-module=contextlib",
+            "--include-module=mimetypes",
+            "--include-module=weakref",
+            "--include-module=queue",
 
-            # Flask stack
+            # ── FLASK STACK ───────────────────────────────────────────────────
             "--include-package=flask",
             "--include-package=flask_cors",
             "--include-package=werkzeug",
@@ -82,7 +99,7 @@ jobs:
             "--include-package=itsdangerous",
             "--include-package=markupsafe",
 
-            # HTTP + scraping
+            # ── HTTP + SCRAPING ───────────────────────────────────────────────
             "--include-package=requests",
             "--include-package=urllib3",
             "--include-package=certifi",
@@ -91,31 +108,40 @@ jobs:
             "--include-package=bs4",
             "--include-package=nyaapy",
 
-            # libtorrent native extension
-            "--include-data-files=$lt_file=libtorrent.pyd",
+            # ── SYSTEM TRAY ───────────────────────────────────────────────────
+            "--include-package=pystray",
+            "--include-package=PIL",
 
+            # ── LIBTORRENT (extensão nativa .pyd) ────────────────────────────
+            # Copia o .pyd para a raiz do bundle com o nome que o Python espera.
+            "--include-data-files=${lt_file}=libtorrent.pyd",
+
+            # Mostra console para ver logs do servidor Flask
             "--windows-console-mode=attach"
           )
 
           if (Test-Path "icon.ico") {
-            Write-Host "Ícone encontrado."
+            Write-Host "Ícone encontrado — adicionando ao EXE."
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
+          # Arquivo de entrada: único script principal
           $nuitka_args += "torrent_stream.py"
+
+          Write-Host "Executando: python $($nuitka_args -join ' ')"
           python @nuitka_args
 
       - name: Verificar EXE gerado
         run: |
           if (Test-Path "torrent_stream.exe") {
             $size = (Get-Item "torrent_stream.exe").length / 1MB
-            Write-Host "✅ torrent_stream.exe gerado — $([math]::Round($size,1)) MB"
+            Write-Host "✅ torrent_stream.exe gerado — $([math]::Round($size, 1)) MB"
           } else {
-            Write-Error "❌ EXE não encontrado!"
+            Write-Error "❌ EXE não encontrado após compilação!"
             exit 1
           }
 
-      - name: Upload do EXE
+      - name: Upload do EXE como artefato
         uses: actions/upload-artifact@v4
         with:
           name: torrent_stream_windows
