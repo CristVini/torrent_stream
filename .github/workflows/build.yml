@@ -42,26 +42,20 @@ jobs:
             ordered-set `
             zstandard
 
-          # Verificações — se libtorrent falhar aqui, o build para com mensagem clara
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
           python -c "import flask;      print('flask      OK:', flask.__version__)"
           python -c "import requests;   print('requests   OK:', requests.__version__)"
           python -c "import nyaapy;     print('nyaapy     OK')"
           python -c "import pystray;    print('pystray    OK')"
 
-      - name: Localizar arquivos do libtorrent
-        id: lt_info
+      - name: Inspecionar e montar bundle do libtorrent
+        id: lt_bundle
         run: |
-          # Mostra tudo sobre o pacote instalado (útil para debug)
           python -c "
           import libtorrent, os, glob
-
           pkg_dir = os.path.dirname(os.path.abspath(libtorrent.__file__))
-          print('version  :', libtorrent.version)
-          print('__file__ :', libtorrent.__file__)
-          print('pkg_dir  :', pkg_dir)
-          print()
-          print('Arquivos no pacote:')
+          print('version :', libtorrent.version)
+          print('pkg_dir :', pkg_dir)
           for f in sorted(os.listdir(pkg_dir)):
               size = os.path.getsize(os.path.join(pkg_dir, f))
               print(f'  {f}  ({size:,} bytes)')
@@ -72,25 +66,52 @@ jobs:
           print(os.path.dirname(os.path.abspath(libtorrent.__file__)))
           "
           $pkg_dir = $pkg_dir.Trim()
-          Write-Host "PKG_DIR=$pkg_dir"
           echo "PKG_DIR=$pkg_dir" >> $env:GITHUB_OUTPUT
+          Write-Host "PKG_DIR=$pkg_dir"
 
-      - name: Localizar DLLs do libtorrent-windows-dll
-        id: lt_dlls
-        run: |
-          # libtorrent-windows-dll instala as DLLs OpenSSL em site-packages
-          $dll_info = python -c "
-          import importlib.util, os, glob, sys
+          # DLLs que o Nuitka já inclui automaticamente — NÃO duplicar
+          # (libcrypto, libssl e quaisquer VC++ runtimes)
+          $nuitka_managed = @(
+            "libcrypto-1_1-x64.dll",
+            "libcrypto-3-x64.dll",
+            "libcrypto.dll",
+            "libssl-1_1-x64.dll",
+            "libssl-3-x64.dll",
+            "libssl.dll",
+            "msvcp140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "python3.dll",
+            "python311.dll"
+          )
 
-          # Procura o pacote libtorrent_windows_dll
-          for name in ['libtorrent_windows_dll', 'libtorrent-windows-dll']:
+          New-Item -ItemType Directory -Force -Path "lt_bundle" | Out-Null
+
+          # Copia .pyd do libtorrent (necessário — extensão nativa)
+          Get-ChildItem $pkg_dir -Filter "*.pyd" | ForEach-Object {
+            Copy-Item $_.FullName "lt_bundle\" -Force
+            Write-Host "Incluído .pyd: $($_.Name)  ($([math]::Round($_.Length/1KB,1)) KB)"
+          }
+
+          # Copia .dll do libtorrent, EXCETO as que o Nuitka já gerencia
+          Get-ChildItem $pkg_dir -Filter "*.dll" | ForEach-Object {
+            if ($nuitka_managed -contains $_.Name.ToLower()) {
+              Write-Host "Ignorado (Nuitka gerencia): $($_.Name)"
+            } else {
+              Copy-Item $_.FullName "lt_bundle\" -Force
+              Write-Host "Incluído .dll: $($_.Name)  ($([math]::Round($_.Length/1KB,1)) KB)"
+            }
+          }
+
+          # Copia DLLs do libtorrent-windows-dll, EXCETO as gerenciadas pelo Nuitka
+          $dll_dir = python -c "
+          import importlib.util, os, glob, site
+          for name in ['libtorrent_windows_dll']:
               spec = importlib.util.find_spec(name)
               if spec:
                   print(os.path.dirname(spec.origin))
                   break
           else:
-              # Fallback: procura DLLs em todo o site-packages
-              import site
               for sp in site.getsitepackages():
                   dlls = glob.glob(os.path.join(sp, '*.dll'))
                   if dlls:
@@ -98,34 +119,19 @@ jobs:
                       break
               else:
                   print('')
-          "
-          $dll_dir = $dll_info.Trim()
-          Write-Host "DLL_DIR=$dll_dir"
-          echo "DLL_DIR=$dll_dir" >> $env:GITHUB_OUTPUT
+          " 2>$null
+          $dll_dir = $dll_dir.Trim()
 
-      - name: Montar bundle com todos os arquivos nativos
-        run: |
-          $pkg_dir = "${{ steps.lt_info.outputs.PKG_DIR }}"
-          $dll_dir = "${{ steps.lt_dlls.outputs.DLL_DIR }}"
-
-          New-Item -ItemType Directory -Force -Path "lt_bundle" | Out-Null
-
-          # 1. Copia .pyd e .dll do pacote libtorrent
-          Write-Host "=== libtorrent pkg ($pkg_dir) ==="
-          Get-ChildItem $pkg_dir -Include "*.pyd","*.dll" -Recurse | ForEach-Object {
-            Copy-Item $_.FullName "lt_bundle\" -Force
-            Write-Host "  + $($_.Name)"
-          }
-
-          # 2. Copia DLLs do libtorrent-windows-dll (OpenSSL etc.)
           if ($dll_dir -and (Test-Path $dll_dir)) {
-            Write-Host "=== libtorrent-windows-dll ($dll_dir) ==="
+            Write-Host "libtorrent-windows-dll dir: $dll_dir"
             Get-ChildItem $dll_dir -Filter "*.dll" | ForEach-Object {
-              Copy-Item $_.FullName "lt_bundle\" -Force
-              Write-Host "  + $($_.Name)"
+              if ($nuitka_managed -contains $_.Name.ToLower()) {
+                Write-Host "Ignorado (Nuitka gerencia): $($_.Name)"
+              } else {
+                Copy-Item $_.FullName "lt_bundle\" -Force
+                Write-Host "Incluído .dll extra: $($_.Name)"
+              }
             }
-          } else {
-            Write-Host "⚠ libtorrent-windows-dll não encontrado — pode funcionar mesmo assim"
           }
 
           Write-Host "`n=== Conteúdo final de lt_bundle/ ==="
@@ -133,17 +139,20 @@ jobs:
             Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1KB,1)) KB)"
           }
 
-          if ((Get-ChildItem "lt_bundle").Count -eq 0) {
-            Write-Error "lt_bundle vazio — instalação do libtorrent falhou"
+          if ((Get-ChildItem "lt_bundle" -Filter "*.pyd").Count -eq 0) {
+            Write-Error "Nenhum .pyd encontrado — instalação do libtorrent falhou"
             exit 1
           }
 
       - name: Compilar com Nuitka
         run: |
-          # Gera um --include-data-files para cada arquivo em lt_bundle/
+          # Gera --include-data-files apenas para arquivos em lt_bundle/
           $data_args = Get-ChildItem "lt_bundle" | ForEach-Object {
             "--include-data-files=lt_bundle\$($_.Name)=$($_.Name)"
           }
+
+          Write-Host "Data files incluídos:"
+          $data_args | ForEach-Object { Write-Host "  $_" }
 
           $nuitka_args = @(
             "-m", "nuitka",
@@ -170,6 +179,7 @@ jobs:
             "--include-module=re",
             "--include-module=shutil",
             "--include-module=subprocess",
+            "--include-module=struct",
 
             # Flask stack
             "--include-package=flask",
