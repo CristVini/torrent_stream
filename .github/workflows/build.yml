@@ -102,7 +102,7 @@ jobs:
             $nuitka_args += "--windows-icon-from-ico=icon.ico"
           }
 
-          $nuitka_args += "main.py"
+          $nuitka_args += "torrent_stream.py"
           python @nuitka_args
 
       - name: Verificar EXE gerado
