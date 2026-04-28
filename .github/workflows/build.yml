@@ -22,22 +22,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ── Visual C++ Redistributable (libtorrent precisa das DLLs MSVC) ─────
-      - name: Instalar Visual C++ Redistributable
-        run: |
-          $url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-          $out = "$env:TEMP\vc_redist.x64.exe"
-          Invoke-WebRequest -Uri $url -OutFile $out
-          Start-Process -FilePath $out -Args "/install /quiet /norestart" -Wait
-          Write-Host "✅ VC++ Redistributable instalado"
-
       - name: Instalar dependências Python
         run: |
           python -m pip install --upgrade pip
 
-          # libtorrent: wheel oficial do PyPI para Windows + Python 3.11
-          # O pacote 'libtorrent' no PyPI (mantido por arvidn) inclui as DLLs
-          pip install "libtorrent==2.0.9"
+          # libtorrent 2.0.11 tem wheel oficial cp311-win_amd64 no PyPI
+          # libtorrent-windows-dll fornece as DLLs OpenSSL necessárias no Windows
+          pip install "libtorrent==2.0.11" libtorrent-windows-dll
 
           pip install `
             flask `
@@ -51,72 +42,107 @@ jobs:
             ordered-set `
             zstandard
 
-          # Verificações
+          # Verificações — se libtorrent falhar aqui, o build para com mensagem clara
           python -c "import libtorrent; print('libtorrent OK:', libtorrent.version)"
-          python -c "import flask;      print('flask      OK')"
-          python -c "import requests;   print('requests   OK')"
+          python -c "import flask;      print('flask      OK:', flask.__version__)"
+          python -c "import requests;   print('requests   OK:', requests.__version__)"
           python -c "import nyaapy;     print('nyaapy     OK')"
           python -c "import pystray;    print('pystray    OK')"
 
-      - name: Inspecionar pacote libtorrent
+      - name: Localizar arquivos do libtorrent
         id: lt_info
         run: |
+          # Mostra tudo sobre o pacote instalado (útil para debug)
           python -c "
-          import libtorrent, os, glob, sys
+          import libtorrent, os, glob
 
           pkg_dir = os.path.dirname(os.path.abspath(libtorrent.__file__))
-          print('pkg_dir:', pkg_dir)
-          print('__file__:', libtorrent.__file__)
+          print('version  :', libtorrent.version)
+          print('__file__ :', libtorrent.__file__)
+          print('pkg_dir  :', pkg_dir)
+          print()
           print('Arquivos no pacote:')
           for f in sorted(os.listdir(pkg_dir)):
-              full = os.path.join(pkg_dir, f)
-              size = os.path.getsize(full)
-              print(f'  {f}  ({size} bytes)')
+              size = os.path.getsize(os.path.join(pkg_dir, f))
+              print(f'  {f}  ({size:,} bytes)')
           "
 
-          # Salva o pkg_dir para o próximo step
-          $pkg_dir = python -c "import libtorrent,os; print(os.path.dirname(os.path.abspath(libtorrent.__file__)))"
-          echo "PKG_DIR=$pkg_dir" >> $env:GITHUB_OUTPUT
+          $pkg_dir = python -c "
+          import libtorrent, os
+          print(os.path.dirname(os.path.abspath(libtorrent.__file__)))
+          "
+          $pkg_dir = $pkg_dir.Trim()
           Write-Host "PKG_DIR=$pkg_dir"
+          echo "PKG_DIR=$pkg_dir" >> $env:GITHUB_OUTPUT
 
-      - name: Copiar arquivos do libtorrent para bundle
-        id: lt_bundle
+      - name: Localizar DLLs do libtorrent-windows-dll
+        id: lt_dlls
+        run: |
+          # libtorrent-windows-dll instala as DLLs OpenSSL em site-packages
+          $dll_info = python -c "
+          import importlib.util, os, glob, sys
+
+          # Procura o pacote libtorrent_windows_dll
+          for name in ['libtorrent_windows_dll', 'libtorrent-windows-dll']:
+              spec = importlib.util.find_spec(name)
+              if spec:
+                  print(os.path.dirname(spec.origin))
+                  break
+          else:
+              # Fallback: procura DLLs em todo o site-packages
+              import site
+              for sp in site.getsitepackages():
+                  dlls = glob.glob(os.path.join(sp, '*.dll'))
+                  if dlls:
+                      print(sp)
+                      break
+              else:
+                  print('')
+          "
+          $dll_dir = $dll_info.Trim()
+          Write-Host "DLL_DIR=$dll_dir"
+          echo "DLL_DIR=$dll_dir" >> $env:GITHUB_OUTPUT
+
+      - name: Montar bundle com todos os arquivos nativos
         run: |
           $pkg_dir = "${{ steps.lt_info.outputs.PKG_DIR }}"
+          $dll_dir = "${{ steps.lt_dlls.outputs.DLL_DIR }}"
+
           New-Item -ItemType Directory -Force -Path "lt_bundle" | Out-Null
 
-          # Copia .pyd, .dll e .pyi do libtorrent
-          $copied = @()
-          Get-ChildItem $pkg_dir -Recurse -Include "*.pyd","*.dll","*.pyi" | ForEach-Object {
-            Copy-Item $_.FullName -Destination "lt_bundle\" -Force
-            $copied += $_.Name
-            Write-Host "Copiado: $($_.Name)  ($([math]::Round($_.Length/1KB,1)) KB)"
+          # 1. Copia .pyd e .dll do pacote libtorrent
+          Write-Host "=== libtorrent pkg ($pkg_dir) ==="
+          Get-ChildItem $pkg_dir -Include "*.pyd","*.dll" -Recurse | ForEach-Object {
+            Copy-Item $_.FullName "lt_bundle\" -Force
+            Write-Host "  + $($_.Name)"
           }
 
-          if ($copied.Count -eq 0) {
-            # Fallback: copia tudo que não for .py
-            Get-ChildItem $pkg_dir | Where-Object { $_.Extension -ne ".py" -and -not $_.PSIsContainer } | ForEach-Object {
-              Copy-Item $_.FullName -Destination "lt_bundle\" -Force
-              Write-Host "Fallback copiado: $($_.Name)"
+          # 2. Copia DLLs do libtorrent-windows-dll (OpenSSL etc.)
+          if ($dll_dir -and (Test-Path $dll_dir)) {
+            Write-Host "=== libtorrent-windows-dll ($dll_dir) ==="
+            Get-ChildItem $dll_dir -Filter "*.dll" | ForEach-Object {
+              Copy-Item $_.FullName "lt_bundle\" -Force
+              Write-Host "  + $($_.Name)"
             }
+          } else {
+            Write-Host "⚠ libtorrent-windows-dll não encontrado — pode funcionar mesmo assim"
           }
 
-          Write-Host "`nConteúdo de lt_bundle/:"
-          Get-ChildItem "lt_bundle" | ForEach-Object { Write-Host "  $($_.Name)" }
+          Write-Host "`n=== Conteúdo final de lt_bundle/ ==="
+          Get-ChildItem "lt_bundle" | ForEach-Object {
+            Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1KB,1)) KB)"
+          }
 
-          # Verifica se há algum arquivo útil
-          $total = (Get-ChildItem "lt_bundle").Count
-          if ($total -eq 0) {
-            Write-Error "lt_bundle está vazio — verifique a instalação do libtorrent"
+          if ((Get-ChildItem "lt_bundle").Count -eq 0) {
+            Write-Error "lt_bundle vazio — instalação do libtorrent falhou"
             exit 1
           }
 
       - name: Compilar com Nuitka
         run: |
-          # Monta --include-data-files para cada arquivo em lt_bundle/
-          $data_args = @()
-          Get-ChildItem "lt_bundle" | ForEach-Object {
-            $data_args += "--include-data-files=lt_bundle\$($_.Name)=$($_.Name)"
+          # Gera um --include-data-files para cada arquivo em lt_bundle/
+          $data_args = Get-ChildItem "lt_bundle" | ForEach-Object {
+            "--include-data-files=lt_bundle\$($_.Name)=$($_.Name)"
           }
 
           $nuitka_args = @(
@@ -127,7 +153,7 @@ jobs:
             "--enable-plugin=tk-inter",
             "--output-filename=torrent_stream.exe",
 
-            # ── stdlib para DLNA/UPnP, SSE e Flask ───────────────────────────
+            # stdlib para DLNA/UPnP, SSE, Flask
             "--include-module=socket",
             "--include-module=select",
             "--include-module=socketserver",
@@ -145,7 +171,7 @@ jobs:
             "--include-module=shutil",
             "--include-module=subprocess",
 
-            # ── Flask stack ───────────────────────────────────────────────────
+            # Flask stack
             "--include-package=flask",
             "--include-package=flask_cors",
             "--include-package=werkzeug",
@@ -154,7 +180,7 @@ jobs:
             "--include-package=itsdangerous",
             "--include-package=markupsafe",
 
-            # ── HTTP + scraping ───────────────────────────────────────────────
+            # HTTP + scraping
             "--include-package=requests",
             "--include-package=urllib3",
             "--include-package=certifi",
@@ -163,14 +189,13 @@ jobs:
             "--include-package=bs4",
             "--include-package=nyaapy",
 
-            # ── System tray ───────────────────────────────────────────────────
+            # System tray
             "--include-package=pystray",
             "--include-package=PIL",
 
             "--windows-console-mode=attach"
           )
 
-          # Adiciona todos os arquivos do libtorrent
           $nuitka_args += $data_args
 
           if (Test-Path "icon.ico") {
@@ -180,7 +205,7 @@ jobs:
 
           $nuitka_args += "torrent_stream.py"
 
-          Write-Host "Chamando Nuitka com $($nuitka_args.Count) argumentos..."
+          Write-Host "Iniciando Nuitka ($($nuitka_args.Count) args)..."
           python @nuitka_args
 
       - name: Verificar EXE gerado
@@ -189,7 +214,7 @@ jobs:
             $size = (Get-Item "torrent_stream.exe").length / 1MB
             Write-Host "✅ torrent_stream.exe — $([math]::Round($size, 1)) MB"
           } else {
-            Write-Error "❌ EXE não encontrado após compilação!"
+            Write-Error "❌ EXE não encontrado!"
             exit 1
           }
 
