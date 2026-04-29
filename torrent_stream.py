@@ -1,17 +1,67 @@
 # ── IMPORTS ────────────────────────────────────────────────────────────────
 import base64
 import io
-import libtorrent as lt
-import time
 import os
 import sys
+vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if os.path.isdir(vendor_dir):
+    sys.path.insert(0, vendor_dir)
+import libtorrent as lt
+import time
 import shutil
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
-import requests as http_requests
+
+# Import requests with fallback to urllib
+try:
+    import requests as http_requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    import urllib.request
+    import urllib.error
+    import json
+    REQUESTS_AVAILABLE = False
+    
+    # Create a minimal requests-like interface using urllib
+    class MockRequests:
+        class exceptions:
+            ConnectionError = urllib.error.URLError
+            Timeout = urllib.error.URLError
+        
+        @staticmethod
+        def get(url, headers=None, timeout=10):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    content = response.read().decode('utf-8')
+                    status_code = response.getcode()
+                    
+                    class MockResponse:
+                        def __init__(self, content, status_code):
+                            self.content = content
+                            self.status_code = status_code
+                            self.text = content
+                        
+                        def json(self):
+                            return json.loads(content)
+                    
+                    return MockResponse(content, status_code)
+            except urllib.error.URLError as e:
+                raise MockRequests.exceptions.ConnectionError(str(e))
+        
+        @staticmethod
+        def utils():
+            class Utils:
+                @staticmethod
+                def quote(s):
+                    return urllib.parse.quote(str(s))
+            return Utils()
+    
+    http_requests = MockRequests()
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import json
@@ -22,8 +72,296 @@ import mimetypes
 import socket
 import select
 import traceback
+import zipfile
+import urllib.request
+import urllib.error
+import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import contextmanager
+import statistics
+
+# Try to import TTLCache, fallback to dict
+try:
+    from cachetools import TTLCache
+    _has_cachetools = True
+except ImportError:
+    _has_cachetools = False
+    print("⚠️  cachetools not available, using simple dict for cache")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── CONFIGURAÇÃO ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Porta do servidor (pode ser configurada via variável de ambiente PORT)
+PORT = int(os.environ.get("PORT", "5000"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── FFMPEG AUTO-DOWNLOAD ENGINE ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+# URL do build estático do FFmpeg para Windows (BtbN/FFmpeg-Builds — mais confiável)
+# Usamos o release "essentials" que inclui ffmpeg.exe e ffprobe.exe (~80 MB)
+FFMPEG_WIN_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+    "ffmpeg-master-latest-win64-gpl.zip"
+)
+
+# Pasta onde o FFmpeg será extraído (junto ao executável do app)
+FFMPEG_LOCAL_DIR = os.path.join(os.path.dirname(sys.executable), "ffmpeg_bin")
+
+
+def _ffmpeg_in_path() -> bool:
+    """Verifica se ffmpeg e ffprobe já estão disponíveis no PATH."""
+    try:
+        r1 = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, timeout=5,
+        )
+        r2 = subprocess.run(
+            ["ffprobe", "-version"],
+            capture_output=True, timeout=5,
+        )
+        return r1.returncode == 0 and r2.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _ffmpeg_local_exists() -> bool:
+    """Verifica se o FFmpeg já foi baixado na pasta local do app."""
+    ffmpeg_exe  = os.path.join(FFMPEG_LOCAL_DIR, "ffmpeg.exe")
+    ffprobe_exe = os.path.join(FFMPEG_LOCAL_DIR, "ffprobe.exe")
+    return os.path.exists(ffmpeg_exe) and os.path.exists(ffprobe_exe)
+
+
+def _add_ffmpeg_to_path() -> None:
+    """Adiciona a pasta local do FFmpeg ao PATH do processo atual."""
+    if FFMPEG_LOCAL_DIR not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = FFMPEG_LOCAL_DIR + os.pathsep + os.environ.get("PATH", "")
+        print(f"✅ FFmpeg local adicionado ao PATH: {FFMPEG_LOCAL_DIR}")
+
+
+def _find_ffmpeg_in_zip(zip_ref: zipfile.ZipFile) -> Dict[str, str]:
+    """
+    Localiza ffmpeg.exe e ffprobe.exe dentro do ZIP (podem estar em subpastas).
+    Retorna dict: {"ffmpeg.exe": "caminho/dentro/do/zip", ...}
+    """
+    targets = {}
+    for name in zip_ref.namelist():
+        basename = os.path.basename(name)
+        if basename in ("ffmpeg.exe", "ffprobe.exe") and "/bin/" in name:
+            targets[basename] = name
+    # fallback: qualquer local
+    if len(targets) < 2:
+        for name in zip_ref.namelist():
+            basename = os.path.basename(name)
+            if basename in ("ffmpeg.exe", "ffprobe.exe") and basename not in targets:
+                targets[basename] = name
+    return targets
+
+
+def download_ffmpeg(progress_callback=None) -> bool:
+    """
+    Baixa e extrai o FFmpeg estático para Windows.
+
+    Args:
+        progress_callback: função(bytes_baixados, total_bytes) chamada durante download.
+
+    Returns:
+        True se bem-sucedido, False caso contrário.
+    """
+    os.makedirs(FFMPEG_LOCAL_DIR, exist_ok=True)
+    zip_path = os.path.join(FFMPEG_LOCAL_DIR, "_ffmpeg_download.zip")
+
+    print(f"⬇ Baixando FFmpeg de:\n  {FFMPEG_WIN_URL}")
+
+    try:
+        req = urllib.request.Request(
+            FFMPEG_WIN_URL,
+            headers={
+                "User-Agent": "TorrentStream/3.2.0 (FFmpeg auto-installer)",
+                "Accept":     "*/*",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 256 * 1024  # 256 KB
+
+            with open(zip_path, "wb") as out:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, total)
+
+        print(f"✅ Download concluído: {downloaded / 1024 / 1024:.1f} MB")
+
+    except Exception as e:
+        print(f"❌ Erro no download do FFmpeg: {e}")
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return False
+
+    # Extrai ffmpeg.exe e ffprobe.exe do ZIP
+    print("📦 Extraindo FFmpeg...")
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            targets = _find_ffmpeg_in_zip(zf)
+
+            if not targets:
+                print("❌ ffmpeg.exe / ffprobe.exe não encontrados no ZIP")
+                return False
+
+            for dest_name, zip_path_inner in targets.items():
+                dest_file = os.path.join(FFMPEG_LOCAL_DIR, dest_name)
+                print(f"   Extraindo: {zip_path_inner} → {dest_file}")
+                with zf.open(zip_path_inner) as src, open(dest_file, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+        print(f"✅ FFmpeg extraído em: {FFMPEG_LOCAL_DIR}")
+
+    except Exception as e:
+        print(f"❌ Erro ao extrair FFmpeg: {e}")
+        return False
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+    return _ffmpeg_local_exists()
+
+
+def ensure_ffmpeg(parent_window=None) -> bool:
+    """
+    Garante que FFmpeg está disponível, baixando automaticamente se necessário.
+    Mostra uma janela de progresso com Tkinter se parent_window for fornecido.
+
+    Returns:
+        True se FFmpeg está pronto para uso.
+    """
+    # 1. Já está no PATH do sistema?
+    if _ffmpeg_in_path():
+        print("✅ FFmpeg encontrado no PATH do sistema")
+        return True
+
+    # 2. Já foi baixado localmente?
+    if _ffmpeg_local_exists():
+        _add_ffmpeg_to_path()
+        if _ffmpeg_in_path():
+            print("✅ FFmpeg local carregado com sucesso")
+            return True
+
+    # 3. Precisa baixar
+    if sys.platform != "win32":
+        print("⚠ Download automático de FFmpeg disponível apenas para Windows.")
+        print("  Instale FFmpeg manualmente: https://ffmpeg.org/download.html")
+        return False
+
+    print("⚠ FFmpeg não encontrado — iniciando download automático...")
+
+    if parent_window is None:
+        # Modo headless: baixa sem GUI
+        return download_ffmpeg() and (_add_ffmpeg_to_path() or True) and _ffmpeg_in_path()
+
+    # Modo GUI: janela de progresso
+    return _download_ffmpeg_with_ui(parent_window)
+
+
+def _download_ffmpeg_with_ui(parent) -> bool:
+    """
+    Exibe uma janela de progresso Tkinter enquanto baixa o FFmpeg.
+    Bloqueia até o download terminar.
+    """
+    result = {"success": False}
+
+    win = tk.Toplevel(parent)
+    win.title("Baixando FFmpeg")
+    win.geometry("480x220")
+    win.resizable(False, False)
+    win.configure(bg="#1e1e2e")
+    win.grab_set()
+    win.transient(parent)
+
+    tk.Label(
+        win, text="📦 Baixando FFmpeg automaticamente",
+        font=("Segoe UI", 13, "bold"), bg="#1e1e2e", fg="#cdd6f4",
+    ).pack(pady=(20, 4))
+
+    tk.Label(
+        win,
+        text="O FFmpeg é necessário para transcodificação de vídeo.\nIsso só acontece uma vez (~80 MB).",
+        font=("Segoe UI", 9), bg="#1e1e2e", fg="#a6adc8", justify="center",
+    ).pack()
+
+    status_var = tk.StringVar(value="Conectando ao servidor...")
+    tk.Label(win, textvariable=status_var, font=("Segoe UI", 9),
+             bg="#1e1e2e", fg="#89b4fa").pack(pady=(10, 4))
+
+    progress_var = tk.DoubleVar(value=0)
+    pb = ttk.Progressbar(win, variable=progress_var, maximum=100,
+                         length=420, mode="determinate")
+    pb.pack(padx=30)
+
+    size_var = tk.StringVar(value="")
+    tk.Label(win, textvariable=size_var, font=("Segoe UI", 8),
+             bg="#1e1e2e", fg="#6c7086").pack(pady=4)
+
+    def on_progress(downloaded: int, total: int) -> None:
+        if total > 0:
+            pct = downloaded / total * 100
+            progress_var.set(pct)
+            size_var.set(
+                f"{downloaded / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB"
+            )
+            status_var.set(f"Baixando... {pct:.0f}%")
+        else:
+            size_var.set(f"{downloaded / 1024 / 1024:.1f} MB")
+            status_var.set("Baixando...")
+        try:
+            win.update_idletasks()
+        except Exception:
+            pass
+
+    def _worker():
+        ok = download_ffmpeg(progress_callback=on_progress)
+        if ok:
+            _add_ffmpeg_to_path()
+            ok = _ffmpeg_in_path()
+        result["success"] = ok
+        try:
+            win.after(0, _finish, ok)
+        except Exception:
+            pass
+
+    def _finish(ok: bool) -> None:
+        if ok:
+            status_var.set("✅ FFmpeg instalado com sucesso!")
+            progress_var.set(100)
+            win.after(1200, win.destroy)
+        else:
+            status_var.set("❌ Falha no download")
+            tk.Label(
+                win,
+                text="Instale manualmente: https://ffmpeg.org/download.html",
+                font=("Segoe UI", 8), bg="#1e1e2e", fg="#f38ba8",
+            ).pack()
+            tk.Button(
+                win, text="Fechar", command=win.destroy,
+                bg="#45475a", fg="#cdd6f4", relief="flat",
+            ).pack(pady=8)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    parent.wait_window(win)
+
+    return result["success"]
+
 
 # ── SUBPROCESS UTILS ─────────────────────────────────────────────────────────
 def _win_startupinfo():
@@ -87,6 +425,59 @@ ADDON_HEADERS = {
     "Referer": "https://web.stremio.com/",
 }
 
+# ── ADDON MANAGEMENT ────────────────────────────────────────────────────────
+ADDONS_FILE = os.path.join(os.path.dirname(sys.executable), "torrent_stream_addons.json")
+
+def load_custom_addons() -> List[str]:
+    """Carrega addons customizados do arquivo JSON."""
+    try:
+        if os.path.exists(ADDONS_FILE):
+            with open(ADDONS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('addons', [])
+    except Exception as e:
+        print(f"⚠ Erro ao carregar addons: {e}")
+    return []
+
+def save_custom_addons(addons: List[str]) -> None:
+    """Salva addons customizados no arquivo JSON."""
+    try:
+        data = {'addons': addons, 'updated': time.time()}
+        with open(ADDONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"✅ {len(addons)} addons salvos")
+    except Exception as e:
+        print(f"❌ Erro ao salvar addons: {e}")
+
+def get_all_addons() -> List[str]:
+    """Retorna todos os addons (customizados + padrão)."""
+    custom = load_custom_addons()
+    if custom:
+        return custom
+    return STREMIO_ADDONS.copy()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ADDON HEALTH CHECK & MANIFEST CACHE (NEW) ───────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+ADDON_MANIFEST_CACHE = {}      # {url: {"manifest": {...}, "cached_at": timestamp}}
+ADDON_HEALTH_CACHE = {}        # {url: {"online": bool, "checked_at": timestamp}}
+MANIFEST_CACHE_TTL = 3600      # 1 hora
+HEALTH_CHECK_TTL = 600         # 10 minutos
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── STREAM CACHE COM TTL (NEW) ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+try:
+    STREAMS_CACHE = TTLCache(maxsize=10000, ttl=14400) if _has_cachetools else {}
+except:
+    STREAMS_CACHE = {}  # Fallback simples
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── PERFORMANCE TRACKING (NEW) ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+ADDON_STATS = {}  # {url: {"times": [...ms], "successes": int, "failures": int}}
+MAX_ADDON_HISTORY = 100
+
 CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), "torrent_stream_config.txt")
 
 CONTENT_TYPES = {
@@ -134,7 +525,13 @@ app = Flask(__name__)
 CORS(app)
 
 ses = lt.session()
-ses.listen_on(6881, 6891)
+import warnings
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    try:
+        ses.listen_on(6881, 6891)
+    except Exception:
+        pass
 
 DOWNLOAD_PATH = ""
 IS_TEMPORARY  = True
@@ -245,7 +642,7 @@ def _dlna_unescape_xml(xml):
 
 
 def _dlna_get_location_url(raw):
-    t = re.findall('\n(?i)location:\s*(.*)\r\s*', raw, re.M)
+    t = re.findall(r'\n(?i)location:\s*(.*)\r\s*', raw, re.M)
     return t[0] if t else ''
 
 
@@ -305,7 +702,6 @@ class DlnapDevice:
         self.has_av_transport = False
 
         if raw is None and ip is not None:
-            # Instância direta por IP (sem descoberta)
             return
 
         try:
@@ -465,7 +861,6 @@ class CastManager:
         self._last_discovery: float = 0
 
     def discover_devices(self, force: bool = False) -> List[Dict[str, str]]:
-        """Descobre dispositivos DLNA na rede. Cache de 30 segundos."""
         now = time.time()
         if not force and (now - self._last_discovery < 30) and self.devices:
             return self._get_device_list()
@@ -494,12 +889,10 @@ class CastManager:
         ]
 
     def _get_device(self, device_ip: str) -> Optional[DlnapDevice]:
-        """Retorna dispositivo do cache ou tenta descoberta direta por IP."""
         with self._lock:
             for d in self.devices:
                 if d.ip == device_ip:
                     return d
-        # Tenta descoberta direta por IP (dispositivo não estava no cache)
         try:
             found = dlna_discover(ip=device_ip, timeout=10)
             if found:
@@ -511,7 +904,6 @@ class CastManager:
         return None
 
     def play_on_device(self, device_ip: str, url: str) -> bool:
-        """Envia URL de vídeo para um dispositivo DLNA e inicia reprodução."""
         target = self._get_device(device_ip)
         if not target:
             print(f"❌ Dispositivo {device_ip} não encontrado")
@@ -531,7 +923,6 @@ class CastManager:
             return False
 
     def stop_device(self, device_ip: str) -> bool:
-        """Para a reprodução no dispositivo."""
         target = self._get_device(device_ip)
         if not target:
             return False
@@ -563,14 +954,12 @@ class CastManager:
             return False
 
 
-# Instância global do CastManager
 cast_manager = CastManager()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── SSE (Server-Sent Events) ENGINE ──────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Filas globais e por info_hash usando WeakSet para auto-limpeza
 _sse_global_queues: "weakref.WeakSet[queue.Queue]" = weakref.WeakSet()
 _sse_global_queues_lock = threading.Lock()
 _sse_hash_queues: Dict[str, "weakref.WeakSet[queue.Queue]"] = {}
@@ -578,13 +967,11 @@ _sse_hash_queues_lock = threading.Lock()
 
 
 def _sse_format(event: str, data: Any) -> str:
-    """Formata uma mensagem SSE."""
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
 
 
 def _sse_broadcast_global(event: str, data: Any) -> None:
-    """Envia evento para todos os clientes SSE globais."""
     msg = _sse_format(event, data)
     with _sse_global_queues_lock:
         for q in list(_sse_global_queues):
@@ -595,7 +982,6 @@ def _sse_broadcast_global(event: str, data: Any) -> None:
 
 
 def _sse_broadcast_hash(info_hash: str, event: str, data: Any) -> None:
-    """Envia evento para os clientes SSE de um torrent específico."""
     msg = _sse_format(event, data)
     with _sse_hash_queues_lock:
         qs = _sse_hash_queues.get(info_hash)
@@ -608,7 +994,6 @@ def _sse_broadcast_hash(info_hash: str, event: str, data: Any) -> None:
 
 
 def _build_torrent_snapshot(h: lt.torrent_handle) -> dict:
-    """Constrói um snapshot do estado atual de um torrent para SSE."""
     s  = h.status()
     ih = str(s.info_hash).lower()
 
@@ -654,11 +1039,6 @@ def _build_torrent_snapshot(h: lt.torrent_handle) -> dict:
 
 
 def _start_sse_ticker() -> None:
-    """
-    Inicia o ticker SSE em background.
-    Emite eventos a cada 2s para todos os clientes conectados.
-    Emite 'global_status' para o canal global e 'progress' para canais individuais.
-    """
     if getattr(_start_sse_ticker, "_started", False):
         return
     _start_sse_ticker._started = True  # type: ignore
@@ -673,13 +1053,11 @@ def _start_sse_ticker() -> None:
 
                 snapshots = [_build_torrent_snapshot(h) for h in torrents]
 
-                # Evento global com todos os torrents
                 _sse_broadcast_global("global_status", {
                     "torrents":   snapshots,
                     "timestamp":  time.time(),
                 })
 
-                # Evento individual por info_hash
                 for snap in snapshots:
                     ih = snap["info_hash"]
                     _sse_broadcast_hash(ih, "progress", snap)
@@ -691,9 +1069,7 @@ def _start_sse_ticker() -> None:
     print("📡 SSE ticker iniciado")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ── CONFIG FILE ──────────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 
 def load_download_path() -> str:
     if os.path.exists(CONFIG_FILE):
@@ -709,9 +1085,18 @@ def save_download_path(path: str) -> None:
 
 # ── CONFIG WINDOW ─────────────────────────────────────────────────────────────
 def show_config_window() -> dict:
+    import os
+    has_display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+    
+    if not has_display:
+        print("⚠ Sem display gráfico — modo headless")
+        import tempfile
+        default_path = os.path.join(tempfile.gettempdir(), "TorrentStream")
+        return {"start": True, "path": default_path, "temporary": True}
+    
     root = tk.Tk()
     root.title("TorrentStream – Configuração")
-    root.geometry("520x370")
+    root.geometry("720x600")  # Aumentado para caber addons
     root.resizable(False, False)
     root.configure(bg="#1e1e2e")
 
@@ -719,13 +1104,27 @@ def show_config_window() -> dict:
     temp_var      = tk.BooleanVar(value=True)
     result        = {"start": False}
 
+    # ── HEADER ──────────────────────────────────────────────────────────────
     tk.Label(root, text="🎬 TorrentStream", font=("Segoe UI", 18, "bold"),
              bg="#1e1e2e", fg="#cdd6f4").pack(pady=(20, 4))
     tk.Label(root, text="Servidor de streaming via torrent",
              font=("Segoe UI", 10), bg="#1e1e2e", fg="#a6adc8").pack()
 
-    chk_frame = tk.Frame(root, bg="#1e1e2e")
-    chk_frame.pack(anchor="w", padx=30, pady=(16, 0))
+    # ── NOTEBOOK (ABAS) ─────────────────────────────────────────────────────
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=20, pady=(10, 0))
+
+    # Aba Principal
+    main_tab = tk.Frame(notebook, bg="#1e1e2e")
+    notebook.add(main_tab, text="📁 Downloads")
+
+    # Aba Addons
+    addons_tab = tk.Frame(notebook, bg="#1e1e2e")
+    notebook.add(addons_tab, text="🔗 Addons")
+
+    # ── ABA DOWNLOADS ──────────────────────────────────────────────────────
+    chk_frame = tk.Frame(main_tab, bg="#1e1e2e")
+    chk_frame.pack(anchor="w", padx=10, pady=(16, 0))
     tk.Checkbutton(
         chk_frame,
         text="Usar pasta temporária (deletar arquivos ao fechar)",
@@ -734,11 +1133,11 @@ def show_config_window() -> dict:
         font=("Segoe UI", 9), cursor="hand2",
     ).pack()
 
-    tk.Label(root, text="Pasta para os arquivos:",
-             font=("Segoe UI", 10), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w", padx=30, pady=(12, 4))
+    tk.Label(main_tab, text="Pasta para os arquivos:",
+             font=("Segoe UI", 10), bg="#1e1e2e", fg="#cdd6f4").pack(anchor="w", padx=10, pady=(12, 4))
 
-    frame = tk.Frame(root, bg="#1e1e2e")
-    frame.pack(fill="x", padx=30)
+    frame = tk.Frame(main_tab, bg="#1e1e2e")
+    frame.pack(fill="x", padx=10)
 
     entry = tk.Entry(frame, textvariable=selected_path, font=("Segoe UI", 9),
                      bg="#313244", fg="#cdd6f4", insertbackground="white",
@@ -754,11 +1153,107 @@ def show_config_window() -> dict:
               relief="flat", font=("Segoe UI", 10), cursor="hand2",
               padx=8).pack(side="left", padx=(6, 0))
 
-    tk.Label(root,
+    tk.Label(main_tab,
              text="⚠ Modo temporário: cria subpasta '.torrentstream_temp' e deleta ao fechar.",
              font=("Segoe UI", 8), bg="#1e1e2e", fg="#6c7086", wraplength=460,
-             ).pack(anchor="w", padx=30)
+             ).pack(anchor="w", padx=10)
 
+    # ── ABA ADDONS ─────────────────────────────────────────────────────────
+    tk.Label(addons_tab, text="🎯 Addons do Stremio",
+             font=("Segoe UI", 14, "bold"), bg="#1e1e2e", fg="#cdd6f4").pack(pady=(20, 10))
+
+    tk.Label(addons_tab,
+             text="Adicione URLs de addons customizados do Stremio.\nSe nenhum for adicionado, usa os addons padrão.",
+             font=("Segoe UI", 9), bg="#1e1e2e", fg="#a6adc8", justify="left").pack(pady=(0, 15))
+
+    # Lista de addons
+    listbox_frame = tk.Frame(addons_tab, bg="#1e1e2e")
+    listbox_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    scrollbar = tk.Scrollbar(listbox_frame)
+    scrollbar.pack(side="right", fill="y")
+
+    addons_listbox = tk.Listbox(
+        listbox_frame, bg="#313244", fg="#cdd6f4", font=("Segoe UI", 9),
+        selectbackground="#89b4fa", selectforeground="#1e1e2e",
+        relief="flat", bd=2, yscrollcommand=scrollbar.set
+    )
+    addons_listbox.pack(fill="both", expand=True)
+    scrollbar.config(command=addons_listbox.yview)
+
+    # Carregar addons atuais
+    current_addons = load_custom_addons()
+    for addon in current_addons:
+        addons_listbox.insert(tk.END, addon)
+
+    # Frame para controles
+    controls_frame = tk.Frame(addons_tab, bg="#1e1e2e")
+    controls_frame.pack(fill="x", padx=10, pady=(0, 20))
+
+    # Campo para adicionar novo addon
+    add_frame = tk.Frame(controls_frame, bg="#1e1e2e")
+    add_frame.pack(fill="x", pady=(0, 10))
+
+    new_addon_var = tk.StringVar()
+    tk.Label(add_frame, text="URL do Addon:",
+             font=("Segoe UI", 9), bg="#1e1e2e", fg="#cdd6f4").pack(side="left")
+
+    addon_entry = tk.Entry(add_frame, textvariable=new_addon_var, font=("Segoe UI", 9),
+                          bg="#313244", fg="#cdd6f4", insertbackground="white",
+                          relief="flat", bd=4, width=40)
+    addon_entry.pack(side="left", fill="x", expand=True, padx=(10, 10))
+
+    def add_addon():
+        url = new_addon_var.get().strip()
+        if url:
+            if url not in current_addons:
+                current_addons.append(url)
+                addons_listbox.insert(tk.END, url)
+                save_custom_addons(current_addons)
+                new_addon_var.set("")
+                messagebox.showinfo("Sucesso", f"Addon adicionado:\n{url}")
+            else:
+                messagebox.showwarning("Atenção", "Este addon já está na lista!")
+        else:
+            messagebox.showwarning("Atenção", "Digite uma URL válida!")
+
+    tk.Button(add_frame, text="➕ Adicionar", command=add_addon,
+              bg="#a6e3a1", fg="#1e1e2e", font=("Segoe UI", 9, "bold"),
+              relief="flat", cursor="hand2", padx=15).pack(side="left")
+
+    # Botões de controle
+    buttons_frame = tk.Frame(controls_frame, bg="#1e1e2e")
+    buttons_frame.pack(fill="x")
+
+    def remove_addon():
+        selection = addons_listbox.curselection()
+        if selection:
+            index = selection[0]
+            url = addons_listbox.get(index)
+            if messagebox.askyesno("Confirmar", f"Remover addon:\n{url}?"):
+                del current_addons[index]
+                addons_listbox.delete(index)
+                save_custom_addons(current_addons)
+                messagebox.showinfo("Sucesso", "Addon removido!")
+        else:
+            messagebox.showwarning("Atenção", "Selecione um addon para remover!")
+
+    def reset_to_default():
+        if messagebox.askyesno("Confirmar", "Restaurar addons padrão?\nIsso removerá todos os addons customizados."):
+            current_addons.clear()
+            addons_listbox.delete(0, tk.END)
+            save_custom_addons([])
+            messagebox.showinfo("Sucesso", "Addons restaurados para padrão!")
+
+    tk.Button(buttons_frame, text="🗑️ Remover Selecionado", command=remove_addon,
+              bg="#f38ba8", fg="#1e1e2e", font=("Segoe UI", 9, "bold"),
+              relief="flat", cursor="hand2", padx=15).pack(side="left", padx=(0, 10))
+
+    tk.Button(buttons_frame, text="🔄 Restaurar Padrão", command=reset_to_default,
+              bg="#f9e2af", fg="#1e1e2e", font=("Segoe UI", 9, "bold"),
+              relief="flat", cursor="hand2", padx=15).pack(side="left")
+
+    # ── BOTÕES GERAIS ──────────────────────────────────────────────────────
     btn_frame = tk.Frame(root, bg="#1e1e2e")
     btn_frame.pack(pady=20)
 
@@ -771,6 +1266,19 @@ def show_config_window() -> dict:
         if not temp_var.get():
             save_download_path(path)
         os.makedirs(path, exist_ok=True)
+
+        # ── Verifica/baixa FFmpeg antes de iniciar ────────────────────────────
+        ffmpeg_ok = ensure_ffmpeg(parent_window=root)
+        if not ffmpeg_ok:
+            messagebox.showwarning(
+                "FFmpeg não disponível",
+                "O FFmpeg não pôde ser instalado automaticamente.\n\n"
+                "O servidor iniciará, mas a transcodificação HLS não funcionará.\n\n"
+                "Instale manualmente em: https://ffmpeg.org/download.html\n"
+                "e adicione ao PATH do sistema.",
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         result.update({"start": True, "path": path, "temporary": temp_var.get()})
         root.destroy()
 
@@ -781,6 +1289,12 @@ def show_config_window() -> dict:
                 shutil.rmtree(dl_path, ignore_errors=True)
             if os.path.exists(CONFIG_FILE):
                 os.remove(CONFIG_FILE)
+            # Remove também o arquivo de addons
+            if os.path.exists(ADDONS_FILE):
+                os.remove(ADDONS_FILE)
+            # Remove também o FFmpeg local
+            if os.path.exists(FFMPEG_LOCAL_DIR):
+                shutil.rmtree(FFMPEG_LOCAL_DIR, ignore_errors=True)
             bat = os.path.join(os.environ.get("TEMP", "/tmp"), "uninstall_ts.bat")
             exe = sys.executable
             with open(bat, "w") as f:
@@ -837,8 +1351,8 @@ def run_tray(download_path: str, is_temporary: bool, stop_event: threading.Event
         )
         pystray.Icon("TorrentStream", img, "TorrentStream", menu).run()
 
-    except ImportError:
-        print("⚠ pystray não encontrado — rodando sem system tray.")
+    except Exception as e:
+        print(f"⚠ system tray não disponível — rodando sem system tray. {e}")
         stop_event.wait()
 
 # ── CLEANUP ──────────────────────────────────────────────────────────────────
@@ -937,7 +1451,7 @@ def get_track_info(file_path: str) -> dict:
                     "is_hearing_impaired": s.get("disposition", {}).get("hearing_impaired",  0) == 1,
                 })
     except FileNotFoundError:
-        print("⚠ ffprobe não encontrado — instale FFmpeg e adicione ao PATH")
+        print("⚠ ffprobe não encontrado")
     except Exception as e:
         print(f"ffprobe error: {e}")
 
@@ -1054,7 +1568,6 @@ def bootstrap_magnet(magnet: str):
     except Exception as e:
         print(f"⚠ Fast-start priority: {e}")
 
-    # Notifica SSE que um novo torrent foi adicionado
     _sse_broadcast_global("torrent_added", {
         "info_hash":    info_hash,
         "name":         handle.status().name,
@@ -1163,9 +1676,16 @@ def search_nyaa(keyword: str, episode: Optional[int] = None,
 
 # ── STREMIO ADDON ENGINE ─────────────────────────────────────────────────────
 def _fetch_addon_streams(addon_url: str, media_type: str, media_id: str) -> List[dict]:
-    base_url   = addon_url.rstrip("/").replace("/manifest.json", "")
+    """Fetch streams com cache TTL support"""
+    cache_key = _get_stream_cache_key(addon_url, media_type, media_id)
+    
+    if cache_key in STREAMS_CACHE:
+        print(f"💾 Cache hit: {addon_url}")
+        return STREAMS_CACHE[cache_key]
+    
+    base_url = addon_url.rstrip("/").replace("/manifest.json", "")
     target_url = f"{base_url}/stream/{media_type}/{media_id}.json"
-
+    
     try:
         r = http_requests.get(target_url, headers=ADDON_HEADERS, timeout=12)
         if r.status_code == 200:
@@ -1173,6 +1693,12 @@ def _fetch_addon_streams(addon_url: str, media_type: str, media_id: str) -> List
                 streams = r.json().get("streams", [])
                 for s in streams:
                     s["_source"] = addon_url
+                
+                cache_control = r.headers.get('Cache-Control', '')
+                ttl = _parse_cache_ttl(cache_control)
+                STREAMS_CACHE[cache_key] = streams
+                print(f"✅ Cached: {addon_url}")
+                
                 return streams
             except ValueError:
                 print(f"❌ JSON inválido de {addon_url}")
@@ -1196,6 +1722,225 @@ def _normalize_stremio_stream(s: dict) -> dict:
         "seeders":  0,
         "dub_type": _nyaa_detect_type(title),
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ADDON MANIFEST CACHE & HEALTH (NEW) ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_addon_base_url(addon_url: str) -> str:
+    """Remove /manifest.json se presente, normaliza URL"""
+    return addon_url.rstrip("/").replace("/manifest.json", "")
+
+def _fetch_addon_manifest(addon_url: str, timeout: int = 8) -> Optional[dict]:
+    """Obtém manifest do addon"""
+    base_url = _get_addon_base_url(addon_url)
+    url = f"{base_url}/manifest.json"
+    
+    try:
+        r = http_requests.get(url, headers=ADDON_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"❌ Manifest fetch error {addon_url}: {e}")
+    
+    return None
+
+def _is_manifest_cached_valid(addon_url: str) -> bool:
+    """Verifica se manifest está em cache"""
+    if addon_url not in ADDON_MANIFEST_CACHE:
+        return False
+    
+    entry = ADDON_MANIFEST_CACHE[addon_url]
+    age = time.time() - entry["cached_at"]
+    return age < MANIFEST_CACHE_TTL
+
+def get_addon_manifest(addon_url: str) -> Optional[dict]:
+    """Obtém manifest com cache automático"""
+    if _is_manifest_cached_valid(addon_url):
+        return ADDON_MANIFEST_CACHE[addon_url]["manifest"]
+    
+    manifest = _fetch_addon_manifest(addon_url)
+    if manifest:
+        ADDON_MANIFEST_CACHE[addon_url] = {
+            "manifest": manifest,
+            "cached_at": time.time()
+        }
+        print(f"✅ Manifest cached: {addon_url}")
+    
+    return manifest
+
+def _addon_supports_media_type(addon_url: str, media_type: str = "series") -> bool:
+    """Verifica se addon suporta tipo de mídia"""
+    manifest = get_addon_manifest(addon_url)
+    if not manifest:
+        return True
+    
+    supported = manifest.get("supportedTypes", [])
+    return media_type in supported or len(supported) == 0
+
+def _check_addon_health(addon_url: str, timeout: int = 5) -> bool:
+    """Verifica se addon está online"""
+    try:
+        base_url = _get_addon_base_url(addon_url)
+        r = http_requests.get(f"{base_url}/manifest.json", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _is_health_cached_valid(addon_url: str) -> bool:
+    """Verifica se health check está em cache"""
+    if addon_url not in ADDON_HEALTH_CACHE:
+        return False
+    
+    entry = ADDON_HEALTH_CACHE[addon_url]
+    age = time.time() - entry["checked_at"]
+    return age < HEALTH_CHECK_TTL
+
+def check_addon_health(addon_url: str, use_cache: bool = True) -> bool:
+    """Verifica saúde do addon (online/offline)"""
+    if use_cache and _is_health_cached_valid(addon_url):
+        return ADDON_HEALTH_CACHE[addon_url]["online"]
+    
+    online = _check_addon_health(addon_url)
+    ADDON_HEALTH_CACHE[addon_url] = {
+        "online": online,
+        "checked_at": time.time()
+    }
+    
+    status = "✅ Online" if online else "❌ Offline"
+    print(f"{status}: {addon_url}")
+    
+    return online
+
+def get_healthy_addons(addon_urls: List[str], timeout_per_check: int = 3) -> List[str]:
+    """Filtra apenas addons online"""
+    if not addon_urls:
+        return []
+    
+    if len(addon_urls) <= 2:
+        return [url for url in addon_urls if check_addon_health(url)]
+    
+    healthy = []
+    with ThreadPoolExecutor(max_workers=min(5, len(addon_urls))) as ex:
+        futures = {
+            ex.submit(check_addon_health, url): url 
+            for url in addon_urls
+        }
+        
+        for future in as_completed(futures, timeout=timeout_per_check * len(addon_urls)):
+            try:
+                is_online = future.result(timeout=timeout_per_check)
+                if is_online:
+                    healthy.append(futures[future])
+            except Exception:
+                pass
+    
+    return healthy
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ADDON PERFORMANCE TRACKING (NEW) ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _record_addon_request(addon_url: str, response_time_ms: float, success: bool):
+    """Registra estatísticas de requisição"""
+    if addon_url not in ADDON_STATS:
+        ADDON_STATS[addon_url] = {
+            "times": [],
+            "successes": 0,
+            "failures": 0,
+            "last_success": 0,
+        }
+    
+    stats = ADDON_STATS[addon_url]
+    stats["times"].append(response_time_ms)
+    
+    if len(stats["times"]) > MAX_ADDON_HISTORY:
+        stats["times"].pop(0)
+    
+    if success:
+        stats["successes"] += 1
+        stats["last_success"] = time.time()
+    else:
+        stats["failures"] += 1
+
+def get_addon_score(addon_url: str) -> float:
+    """Calcula performance score 0-100"""
+    if addon_url not in ADDON_STATS:
+        return 50.0
+    
+    stats = ADDON_STATS[addon_url]
+    
+    if not stats["times"] or (stats["successes"] + stats["failures"]) == 0:
+        return 50.0
+    
+    total = stats["successes"] + stats["failures"]
+    success_rate = min(stats["successes"] / total, 1.0)
+    success_score = success_rate * 50
+    
+    avg_time = statistics.mean(stats["times"])
+    if avg_time < 100:
+        time_score = 40
+    elif avg_time < 300:
+        time_score = 20 + (40 - 20) * ((300 - avg_time) / 200)
+    else:
+        time_score = max(0, 20 - (avg_time - 300) / 50)
+    
+    if len(stats["times"]) > 1:
+        stdev = statistics.stdev(stats["times"])
+        consistency_penalty = min(stdev / 200, 1.0)
+        consistency_score = 10 * (1 - consistency_penalty)
+    else:
+        consistency_score = 10
+    
+    total_score = success_score + time_score + consistency_score
+    
+    return min(100, max(0, total_score))
+
+def sort_addons_by_performance(addon_urls: List[str]) -> List[str]:
+    """Ordena addons por performance score"""
+    scores = {url: get_addon_score(url) for url in addon_urls}
+    sorted_urls = sorted(addon_urls, key=lambda x: scores[x], reverse=True)
+    
+    for url in sorted_urls:
+        score = scores[url]
+        print(f"  {score:5.1f} - {url}")
+    
+    return sorted_urls
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── STREAM CACHE COM TTL (NEW) ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_cache_ttl(cache_control_header: str) -> int:
+    """Parse Cache-Control header para TTL"""
+    if not cache_control_header:
+        return 3600
+    
+    match = re.search(r'max-age=(\d+)', cache_control_header)
+    if match:
+        ttl = int(match.group(1))
+        return min(ttl, 86400)
+    
+    return 3600
+
+def _get_stream_cache_key(addon_url: str, media_type: str, media_id: str) -> str:
+    """Chave única para cache"""
+    return f"{addon_url}|{media_type}|{media_id}"
+
+def clear_addon_cache(addon_url: Optional[str] = None):
+    """Limpa cache global ou de um addon"""
+    if addon_url is None:
+        STREAMS_CACHE.clear()
+        print("🗑 Cache limpo (todos addons)")
+    else:
+        if isinstance(STREAMS_CACHE, dict):
+            keys_to_remove = [
+                k for k in STREAMS_CACHE.keys() 
+                if k.startswith(f"{addon_url}|")
+            ]
+            for k in keys_to_remove:
+                del STREAMS_CACHE[k]
+            print(f"🗑 Cache limpo ({addon_url})")
 
 # ── ID RESOLVERS ─────────────────────────────────────────────────────────────
 def resolve_imdb_id(anime_name: str) -> Optional[str]:
@@ -1252,37 +1997,84 @@ def search_all_sources(
     kitsu_id: Optional[str],
     use_nyaa: bool = True,
     nyaa_trusted: bool = False,
+    addon_urls: Optional[List[str]] = None,
 ) -> List[dict]:
+    """
+    Busca com Priority-1 optimizations:
+    1. Health checks
+    2. Performance tracking
+    3. Cache support
+    """
+    if addon_urls is None:
+        addon_urls = STREMIO_ADDONS.copy()
+    
+    print(f"\n🚀 Search: {name} S{season}E{episode}")
+    
+    # === 1. Health Checks ===
+    print(f"🔍 Health check ({len(addon_urls)} addons)")
+    addon_urls = get_healthy_addons(addon_urls)
+    if not addon_urls:
+        addon_urls = STREMIO_ADDONS.copy()
+    print(f"✅ {len(addon_urls)} online")
+    
+    # === 2. Sort by Performance ===
+    print(f"📊 Sorting by performance")
+    addon_urls = sort_addons_by_performance(addon_urls)
+    
+    # === 3. Parallel Search ===
+    print(f"🌐 Fetching streams")
     all_streams: List[dict] = []
     futures_map = {}
-
+    
     with ThreadPoolExecutor(max_workers=16) as ex:
-
+        
         if imdb_id or kitsu_id:
             ids_to_try = build_stremio_ids(imdb_id, kitsu_id, season, episode)
-            for addon in STREMIO_ADDONS:
+            
+            for addon in addon_urls:
+                if not _addon_supports_media_type(addon, "series"):
+                    continue
+                
                 for mid in ids_to_try:
+                    start_time = time.time()
                     fut = ex.submit(_fetch_addon_streams, addon, "series", mid)
-                    futures_map[fut] = ("stremio", addon)
-
+                    futures_map[fut] = ("stremio", addon, start_time)
+        
         if use_nyaa and name:
+            start_time = time.time()
             fut = ex.submit(search_nyaa, name, episode, season, nyaa_trusted)
-            futures_map[fut] = ("nyaa", "nyaa.si")
-
+            futures_map[fut] = ("nyaa", "nyaa.si", start_time)
+        
+        # === Collect & Track ===
         for future in as_completed(futures_map):
-            source_type, source_name = futures_map[future]
+            source_type, source_name, start_time = futures_map[future]
+            response_time_ms = (time.time() - start_time) * 1000
+            
             try:
                 batch = future.result()
+                success = len(batch) > 0
+                
                 if source_type == "stremio":
+                    _record_addon_request(source_name, response_time_ms, success)
+                    stats = f" [{response_time_ms:.0f}ms]"
+                    print(f"✅ {source_name}: {len(batch)} results{stats}")
                     all_streams.extend([_normalize_stremio_stream(s) for s in batch])
                 else:
+                    stats = f" [{response_time_ms:.0f}ms]"
+                    print(f"✅ {source_name}: {len(batch)} results{stats}")
                     all_streams.extend(batch)
+            
             except Exception as e:
-                print(f"❗ Erro em {source_name}: {e}")
-
+                if source_type == "stremio":
+                    _record_addon_request(source_name, response_time_ms, False)
+                print(f"❌ {source_name}: {e}")
+    
+    # === Post-process ===
+    print(f"📦 Post-processing")
     unique = _deduplicate(all_streams)
     sorted_streams = _sort_streams(unique)
-    print(f"📦 Total final: {len(sorted_streams)} streams únicos")
+    print(f"Total: {len(sorted_streams)} unique streams\n")
+    
     return sorted_streams
 
 
@@ -1546,10 +2338,9 @@ def start_hls_transcode(info_hash: str, file_path: str, mode: str) -> str:
         for i in range(90):
             if os.path.exists(seg0) and os.path.getsize(seg0) > 8192:
                 print(f"✅ Primeiro segmento HLS pronto ({i*0.5:.1f}s)")
-                # Notifica SSE que HLS está pronto
                 _sse_broadcast_hash(info_hash, "ready", {
                     "info_hash": info_hash,
-                    "hls_url":   f"http://localhost:5000/hls/{info_hash}/index.m3u8",
+                    "hls_url":   f"http://localhost:{PORT}/hls/{info_hash}/index.m3u8",
                     "mode":      mode,
                 })
                 return m3u8_path
@@ -1737,22 +2528,85 @@ def google_translate_v1(text: str, target_lang: str = "pt") -> str:
 # ── FLASK ROUTES ──────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── FLASK ROUTES ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return jsonify({
+        "name": "TorrentStream",
+        "version": "3.2.0",
+        "status": "online",
+        "endpoints": {
+            "health": {
+                "GET /ping": "Status do servidor",
+                "GET /ffmpeg/status": "Status do FFmpeg",
+                "GET /transcode/test": "Teste de transcodificação",
+                "GET /status": "Status geral do servidor",
+            },
+            "torrent": {
+                "POST /addons/start": "Iniciar torrent a partir de magnet/infoHash",
+                "GET /stream/<info_hash>": "Stream direto do arquivo",
+                "POST /stop": "Parar torrent",
+                "GET /play": "Reproduzir arquivo via magnet",
+            },
+            "hls": {
+                "GET /hls/<info_hash>/index.m3u8": "Playlist HLS",
+                "GET /hls/<info_hash>/<segment>": "Segmento HLS",
+                "POST /hls/select-audio/<info_hash>": "Selecionar trilha de áudio",
+                "GET /transcode/status/<info_hash>": "Status da transcodificação",
+            },
+            "search": {
+                "GET /addons/search": "Buscar streams em múltiplas fontes",
+                "GET /nyaa/search": "Buscar anime no Nyaa",
+                "GET /search": "Busca combinada",
+                "GET /tracks/<info_hash>": "Obter informações de trilhas (áudio/legendas)",
+            },
+            "subtitles": {
+                "GET /subtitles/<info_hash>/<sub_index>.vtt": "Extrair legenda em VTT",
+                "GET /subtitles/proxy": "Proxy para legendas remota",
+                "GET /translate-sub/<info_hash>/<track_idx>": "Traduzir legenda",
+            },
+            "cast": {
+                "GET /cast/devices": "Listar Smart TVs (DLNA/UPnP)",
+                "POST /cast/play": "Playback na TV",
+                "POST /cast/stop": "Parar na TV",
+                "POST /cast/pause": "Pausar na TV",
+                "POST /cast/volume": "Ajustar volume da TV",
+            },
+            "events": {
+                "GET /events/global": "SSE: eventos globais",
+                "GET /events/<info_hash>": "SSE: eventos de um torrent",
+            },
+        }
+    })
+
 @app.route("/ping")
 def ping():
     return jsonify({"status": "online", "version": "3.2.0"})
 
+
+# ── /ffmpeg/status ────────────────────────────────────────────────────────────
+@app.route("/ffmpeg/status")
+def ffmpeg_status():
+    """
+    Retorna o status atual do FFmpeg (se está instalado e de onde).
+    Útil para o frontend checar se o FFmpeg está disponível.
+    """
+    in_path   = _ffmpeg_in_path()
+    local_ok  = _ffmpeg_local_exists()
+    return jsonify({
+        "available":    in_path,
+        "local_exists": local_ok,
+        "local_dir":    FFMPEG_LOCAL_DIR,
+        "source":       "system_path" if (in_path and not local_ok) else ("local" if local_ok else "not_found"),
+    })
+
+
 # ── SSE: /events/global ───────────────────────────────────────────────────────
 @app.route("/events/global")
 def sse_global():
-    """
-    Stream de eventos SSE global com estado de todos os torrents.
-    O cliente recebe eventos a cada 2s com o snapshot completo.
-
-    Eventos emitidos:
-      - global_status: lista de todos os torrents ativos
-      - torrent_added: quando um novo torrent é iniciado
-      - torrent_removed: quando um torrent é removido
-    """
     _start_sse_ticker()
 
     q: queue.Queue = queue.Queue(maxsize=50)
@@ -1760,7 +2614,6 @@ def sse_global():
         _sse_global_queues.add(q)
 
     def generate():
-        # Envia estado inicial imediatamente
         try:
             torrents = ses.get_torrents()
             snapshots = [_build_torrent_snapshot(h) for h in torrents]
@@ -1771,7 +2624,6 @@ def sse_global():
         except Exception:
             pass
 
-        # Stream contínuo
         while True:
             try:
                 msg = q.get(timeout=30)
@@ -1793,14 +2645,6 @@ def sse_global():
 # ── SSE: /events/<info_hash> ──────────────────────────────────────────────────
 @app.route("/events/<info_hash>")
 def sse_torrent(info_hash):
-    """
-    Stream de eventos SSE para um torrent específico.
-
-    Eventos emitidos:
-      - progress: atualização de progresso a cada 2s
-      - ready: quando o primeiro segmento HLS está disponível
-      - started: quando o torrent é adicionado à sessão
-    """
     info_hash = info_hash.lower()
     _start_sse_ticker()
 
@@ -1811,7 +2655,6 @@ def sse_torrent(info_hash):
         _sse_hash_queues[info_hash].add(q)
 
     def generate():
-        # Envia snapshot imediato se o torrent já existe
         with active_streams_lock:
             entry = active_streams.get(info_hash)
         if entry:
@@ -1841,15 +2684,6 @@ def sse_torrent(info_hash):
 # ── CAST: /cast/devices ───────────────────────────────────────────────────────
 @app.route("/cast/devices")
 def cast_devices():
-    """
-    Lista todos os dispositivos DLNA/UPnP encontrados na rede local.
-
-    Query params:
-      ?force=true   — ignora o cache de 30s e faz nova descoberta
-
-    Resposta:
-      { "devices": [{ "name": "Samsung TV", "ip": "192.168.1.15", ... }] }
-    """
     force = request.args.get("force", "false").lower() == "true"
     devices = cast_manager.discover_devices(force=force)
     return jsonify({"devices": devices, "count": len(devices)})
@@ -1858,15 +2692,6 @@ def cast_devices():
 # ── CAST: /cast/play ──────────────────────────────────────────────────────────
 @app.route("/cast/play", methods=["POST"])
 def cast_play():
-    """
-    Envia uma URL de vídeo para um dispositivo DLNA e inicia a reprodução.
-
-    Body JSON:
-      { "ip": "192.168.1.15", "url": "http://192.168.1.10:5000/hls/abc.../index.m3u8" }
-
-    Dica: Para TVs antigas (Tizen 2018), prefira o URL direto /stream/<hash>
-    em vez do HLS, pois o player nativo pode não suportar m3u8.
-    """
     data       = request.get_json(silent=True) or {}
     device_ip  = data.get("ip", "").strip()
     url        = data.get("url", "").strip()
@@ -1874,7 +2699,6 @@ def cast_play():
     if not device_ip or not url:
         return jsonify({"error": "'ip' e 'url' são obrigatórios"}), 400
 
-    # Se a URL é relativa ou usa localhost, tenta substituir pelo IP da interface
     if url.startswith("/") or "localhost" in url or "127.0.0.1" in url:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1883,7 +2707,7 @@ def cast_play():
             s.close()
             url = re.sub(r"https?://(localhost|127\.0\.0\.1)", f"http://{server_ip}", url)
             if url.startswith("/"):
-                url = f"http://{server_ip}:5000{url}"
+                url = f"http://{server_ip}:{PORT}{url}"
         except Exception:
             pass
 
@@ -1902,7 +2726,6 @@ def cast_play():
 # ── CAST: /cast/stop ──────────────────────────────────────────────────────────
 @app.route("/cast/stop", methods=["POST"])
 def cast_stop():
-    """Para a reprodução em um dispositivo DLNA."""
     data      = request.get_json(silent=True) or {}
     device_ip = data.get("ip", "").strip()
 
@@ -1916,7 +2739,6 @@ def cast_stop():
 # ── CAST: /cast/pause ─────────────────────────────────────────────────────────
 @app.route("/cast/pause", methods=["POST"])
 def cast_pause():
-    """Pausa a reprodução em um dispositivo DLNA."""
     data      = request.get_json(silent=True) or {}
     device_ip = data.get("ip", "").strip()
 
@@ -1930,7 +2752,6 @@ def cast_pause():
 # ── CAST: /cast/volume ────────────────────────────────────────────────────────
 @app.route("/cast/volume", methods=["POST"])
 def cast_volume():
-    """Ajusta o volume em um dispositivo DLNA."""
     data      = request.get_json(silent=True) or {}
     device_ip = data.get("ip", "").strip()
     volume    = data.get("volume", 50)
@@ -2093,6 +2914,8 @@ def transcode_test():
         "gpu_label":      gpu_labels.get(gpu_encoder, gpu_encoder),
         "issues":         issues,
         "ready":          ffmpeg_ok and ffprobe_ok,
+        "ffmpeg_local_dir": FFMPEG_LOCAL_DIR,
+        "ffmpeg_local_exists": _ffmpeg_local_exists(),
     })
 
 
@@ -2105,6 +2928,15 @@ def addon_search():
     kitsu_id     = request.args.get("kitsu_id", "").strip() or None
     use_nyaa     = request.args.get("nyaa", "true").lower() != "false"
     nyaa_trusted = request.args.get("nyaa_trusted", "false").lower() == "true"
+    
+    # Novo: aceitar addons customizados via parâmetro
+    custom_addons = request.args.get("addons", "").strip()
+    if custom_addons:
+        # Permite múltiplos addons separados por vírgula
+        addon_urls = [url.strip() for url in custom_addons.split(",") if url.strip()]
+    else:
+        # Usa addons padrão se nenhum customizado for especificado
+        addon_urls = STREMIO_ADDONS.copy()
 
     if not name and not imdb_id and not kitsu_id:
         return jsonify({"error": "Forneça 'name', 'imdb_id' ou 'kitsu_id'"}), 400
@@ -2122,6 +2954,7 @@ def addon_search():
         name=name, season=season, episode=episode,
         imdb_id=imdb_id, kitsu_id=kitsu_id,
         use_nyaa=use_nyaa, nyaa_trusted=nyaa_trusted,
+        addon_urls=addon_urls,  # Passa os addons customizados
     )
 
     return jsonify({
@@ -2130,6 +2963,7 @@ def addon_search():
         "meta": {
             "name": name, "imdb_id": imdb_id, "kitsu_id": kitsu_id,
             "season": season, "episode": episode,
+            "addons_used": addon_urls,
         },
     })
 
@@ -2193,8 +3027,8 @@ def addon_start():
 
     resp = {
         "info_hash":        info_hash,
-        "stream_url":       f"http://localhost:5000/stream/{info_hash}",
-        "hls_url":          f"http://localhost:5000/hls/{info_hash}/index.m3u8",
+        "stream_url":       f"http://localhost:{PORT}/stream/{info_hash}",
+        "hls_url":          f"http://localhost:{PORT}/hls/{info_hash}/index.m3u8",
         "transcode_mode":   transcode_mode_detected,
         "name":             s.name,
         "title":            title,
@@ -2209,7 +3043,6 @@ def addon_start():
         if info_hash in active_streams:
             active_streams[info_hash]["track_info"] = resp
 
-    # Notifica SSE que o torrent está "started" (com metadados)
     _sse_broadcast_hash(info_hash, "started", {
         "info_hash":  info_hash,
         "name":       s.name,
@@ -2383,7 +3216,7 @@ def hls_select_audio(info_hash):
     except FFmpegError as e:
         return jsonify(e.to_dict()), 500
 
-    hls_url = f"http://localhost:5000/hls/{info_hash}/index.m3u8?mode={mode}"
+    hls_url = f"http://localhost:{PORT}/hls/{info_hash}/index.m3u8?mode={mode}"
     return jsonify({"hls_url": hls_url, "audio_index": audio_index, "mode": mode})
 
 
@@ -2582,7 +3415,6 @@ def stop_torrent():
             daemon=True,
         ).start()
 
-        # Notifica SSE que o torrent foi removido
         _sse_broadcast_global("torrent_removed", {"info_hash": info_hash})
 
         return jsonify({"success": True})
@@ -2765,6 +3597,12 @@ def translate_sub_endpoint(info_hash, track_idx):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # ── Verificação antecipada do FFmpeg (headless, antes da janela config) ──
+    # Se o FFmpeg já estiver disponível localmente, adiciona ao PATH agora
+    # para que a janela de config não precise lidar com isso depois.
+    if not _ffmpeg_in_path() and _ffmpeg_local_exists():
+        _add_ffmpeg_to_path()
+
     result = show_config_window()
     if not result.get("start"):
         sys.exit(0)
@@ -2777,7 +3615,8 @@ if __name__ == "__main__":
 
     print(f"📁 {DOWNLOAD_PATH}  [{'temporário' if IS_TEMPORARY else 'permanente'}]")
     print(f"🎬 HLS cache: {HLS_CACHE_PATH}")
-    print("🚀 http://0.0.0.0:5000")
+    print(f"🔧 FFmpeg local: {FFMPEG_LOCAL_DIR}")
+    print(f"🚀 http://0.0.0.0:{PORT}")
     print()
     print("📡 Rotas SSE disponíveis:")
     print("   GET /events/global          — eventos de todos os torrents")
@@ -2789,6 +3628,10 @@ if __name__ == "__main__":
     print("   POST /cast/stop             — parar reprodução na TV")
     print("   POST /cast/pause            — pausar reprodução na TV")
     print("   POST /cast/volume           — ajustar volume na TV")
+    print()
+    print("🔧 FFmpeg:")
+    print("   GET  /ffmpeg/status         — checar status do FFmpeg")
+    print("   GET  /transcode/test        — testar transcodificação")
 
     stop_event = threading.Event()
 
@@ -2798,17 +3641,15 @@ if __name__ == "__main__":
         daemon=True,
     ).start()
 
-    # Inicia o SSE ticker automaticamente
     _start_sse_ticker()
 
-    # Faz descoberta DLNA em background ao iniciar
     threading.Thread(
         target=cast_manager.discover_devices,
         daemon=True,
     ).start()
 
     threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True),
+        target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True),
         daemon=True,
     ).start()
 

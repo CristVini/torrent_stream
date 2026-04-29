@@ -1,0 +1,28 @@
+# FFmpeg bindings (pode ser symlink ou binários)
+ffmpeg_bin/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Arquivos temporários
+.torrentstream_temp/
+/tmp/
+
+# Vendored dependencies
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Registros
+*.log
