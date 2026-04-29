@@ -1086,14 +1086,20 @@ def save_download_path(path: str) -> None:
 # ── CONFIG WINDOW ─────────────────────────────────────────────────────────────
 def show_config_window() -> dict:
     import os
-    has_display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
-    
+    import sys
+
+    # No Windows em geral o Tkinter funciona sem DISPLAY; apenas no Linux headless
+    if sys.platform.startswith("linux"):
+        has_display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    else:
+        has_display = True
+
     if not has_display:
         print("⚠ Sem display gráfico — modo headless")
         import tempfile
         default_path = os.path.join(tempfile.gettempdir(), "TorrentStream")
         return {"start": True, "path": default_path, "temporary": True}
-    
+
     root = tk.Tk()
     root.title("TorrentStream – Configuração")
     root.geometry("720x600")  # Aumentado para caber addons
