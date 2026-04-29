@@ -3597,6 +3597,15 @@ def translate_sub_endpoint(info_hash, track_idx):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Adicionar logging para debug do EXE
+    import logging
+    logging.basicConfig(
+        filename=os.path.join(os.path.dirname(__file__), "torrent_stream.log"),
+        level=logging.DEBUG,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    logging.info("Iniciando TorrentStream...")
+
     # ── Verificação antecipada do FFmpeg (headless, antes da janela config) ──
     # Se o FFmpeg já estiver disponível localmente, adiciona ao PATH agora
     # para que a janela de config não precise lidar com isso depois.
@@ -3605,10 +3614,13 @@ if __name__ == "__main__":
 
     result = show_config_window()
     if not result.get("start"):
+        logging.info("Usuário cancelou configuração, saindo.")
         sys.exit(0)
 
     DOWNLOAD_PATH = result["path"]
     IS_TEMPORARY  = result["temporary"]
+
+    logging.info(f"Configuração: DOWNLOAD_PATH={DOWNLOAD_PATH}, IS_TEMPORARY={IS_TEMPORARY}")
 
     HLS_CACHE_PATH = os.path.join(DOWNLOAD_PATH, ".hls_cache")
     os.makedirs(HLS_CACHE_PATH, exist_ok=True)
@@ -3635,6 +3647,7 @@ if __name__ == "__main__":
 
     stop_event = threading.Event()
 
+    logging.info("Iniciando thread do tray...")
     threading.Thread(
         target=run_tray,
         args=(DOWNLOAD_PATH, IS_TEMPORARY, stop_event),
@@ -3643,16 +3656,21 @@ if __name__ == "__main__":
 
     _start_sse_ticker()
 
+    logging.info("Iniciando descoberta de dispositivos DLNA...")
     threading.Thread(
         target=cast_manager.discover_devices,
         daemon=True,
     ).start()
 
+    logging.info("Iniciando servidor Flask...")
     threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True),
         daemon=True,
     ).start()
 
+    logging.info("Aplicação iniciada, aguardando stop_event...")
     stop_event.wait()
+    logging.info("Stop event recebido, fazendo cleanup...")
     cleanup_all()
+    logging.info("Saindo...")
     sys.exit(0)

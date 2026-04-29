@@ -157,7 +157,6 @@ jobs:
           $nuitka_args = @(
             "-m", "nuitka",
             "--onefile",
-            "--standalone",
             "--assume-yes-for-downloads",
             "--enable-plugin=tk-inter",
             "--output-filename=torrent_stream.exe",
@@ -203,7 +202,7 @@ jobs:
             "--include-package=pystray",
             "--include-package=PIL",
 
-            "--windows-console-mode=attach"
+            "--windows-disable-console"
           )
 
           $nuitka_args += $data_args
