@@ -156,9 +156,10 @@ jobs:
 
           $nuitka_args = @(
             "-m", "nuitka",
-            "--onefile",
+            "--standalone",
             "--assume-yes-for-downloads",
             "--enable-plugin=tk-inter",
+            "--output-dir=dist",
             "--output-filename=torrent_stream.exe",
 
             # stdlib para DLNA/UPnP, SSE, Flask
@@ -217,19 +218,34 @@ jobs:
           Write-Host "Iniciando Nuitka ($($nuitka_args.Count) args)..."
           python @nuitka_args
 
-      - name: Verificar EXE gerado
+      - name: Verificar build gerado
         run: |
-          if (Test-Path "torrent_stream.exe") {
+          if (Test-Path "dist\torrent_stream.exe") {
+            $size = (Get-Item "dist\torrent_stream.exe").length / 1MB
+            Write-Host "✅ dist\torrent_stream.exe — $([math]::Round($size, 1)) MB"
+          } elseif (Test-Path "torrent_stream.exe") {
             $size = (Get-Item "torrent_stream.exe").length / 1MB
             Write-Host "✅ torrent_stream.exe — $([math]::Round($size, 1)) MB"
           } else {
-            Write-Error "❌ EXE não encontrado!"
+            Write-Error "❌ Executável não encontrado!"
             exit 1
           }
 
-      - name: Upload do EXE
+      - name: Compactar distribuição
+        run: |
+          $dest = "torrent_stream_dist.zip"
+          if (Test-Path "dist") {
+            if (Test-Path $dest) { Remove-Item $dest -Force }
+            Compress-Archive -Path "dist\*" -DestinationPath $dest -Force
+            Write-Host "✅ Distribuição compactada em $dest"
+          } else {
+            Write-Error "❌ Pasta dist/ não encontrada"
+            exit 1
+          }
+
+      - name: Upload da distribuição
         uses: actions/upload-artifact@v4
         with:
-          name: torrent_stream_windows
-          path: torrent_stream.exe
+          name: torrent_stream_windows_dist
+          path: torrent_stream_dist.zip
           retention-days: 30
