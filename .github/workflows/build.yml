@@ -220,14 +220,15 @@ jobs:
 
       - name: Verificar build gerado
         run: |
-          if (Test-Path 'dist\torrent_stream.exe') {
-            $size = (Get-Item 'dist\torrent_stream.exe').length / 1MB
-            Write-Host '✅ dist\torrent_stream.exe —' $([math]::Round($size, 1)) 'MB'
-          } elseif (Test-Path 'torrent_stream.exe') {
-            $size = (Get-Item 'torrent_stream.exe').length / 1MB
-            Write-Host '✅ torrent_stream.exe —' $([math]::Round($size, 1)) 'MB'
+          Write-Host 'Conteúdo de dist:'
+          Get-ChildItem -Path dist -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          $exe = Get-ChildItem -Path dist -Filter '*.exe' -Recurse | Select-Object -First 1
+          if ($null -ne $exe) {
+            $size = $exe.Length / 1MB
+            Write-Host "✅ Executável encontrado: $($exe.FullName) — $([math]::Round($size, 1)) MB"
           } else {
-            Write-Error '❌ Executável não encontrado!'
+            Write-Error '❌ Nenhum executável .exe encontrado em dist/'
             exit 1
           }
 
