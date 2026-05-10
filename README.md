@@ -1,239 +1,106 @@
-# TorrentStream 🎬
+# TorrentStream
 
-Servidor de streaming via torrent com suporte a HLS, transcodificação, legendas e controle de Smart TVs (DLNA/UPnP).
+Engine web para streaming via torrent com suporte a Stremio addons, HLS e SSE.
 
-## Setup Rápido
+> Este é o único documento oficial. Todos os outros arquivos .md foram removidos.
 
-### 1. Instalar dependências (primeira vez)
+## Por que usar
 
-```bash
-# Linux/Mac
-sudo apt-get install -y python3-tk ffmpeg python3-venv  # Linux
-brew install python3 ffmpeg                               # macOS
+- `GET /addons/search` traz resultados de múltiplas fontes.
+- `GET /events/<info_hash>` oferece progresso em tempo real via SSE.
+- `GET /hls/<info_hash>/index.m3u8` permite reprodução de vídeo em players web.
+- `GET /health` e `GET /addons/status` garantem controle de saúde e performance.
 
-# Setup FFmpeg do projeto
-python3 setup_ffmpeg.py
-```
-
-**Windows**: FFmpeg é baixado automaticamente durante `python3 setup_ffmpeg.py`
-
-### 2. Instalar pacotes Python
+## Como iniciar
 
 ```bash
-# As dependências Python já estão em vendor/ 
-# (instaladas durante desenvolvimento)
-python3 torrent_stream.py
+python torrent_stream.py
 ```
 
-## Addons Customizados do Stremio
+Servidor padrão: `http://localhost:5000`
 
-O TorrentStream suporta addons customizados do Stremio! Você pode especificar suas próprias URLs de addons via parâmetro `addons` na busca ou gerenciá-los na **interface gráfica**.
-
-### Addons Padrão Incluídos:
-- **Torrentio** - `https://torrentio.strem.fun`
-- **MediaFusion** - `https://mediafusion.elfhosted.com`
-- **Comet** - `https://comet.elfhosted.com`
-
-### Gerenciamento via Interface Gráfica:
-
-Na janela de configuração, clique na aba **"🔗 Addons"** para:
-- ✅ **Adicionar** novos addons digitando a URL
-- ✅ **Remover** addons selecionados na lista
-- ✅ **Restaurar** addons padrão (remove todos os customizados)
-- ✅ **Salvar automaticamente** as configurações
-
-### Como Usar Addons Customizados:
+Para porta customizada:
 
 ```bash
-# Via parâmetro (sobrescreve interface gráfica)
-GET /addons/search?name=Breaking%20Bad&season=1&episode=1&addons=https://meu-addon.com
-
-# Via interface gráfica (recomendado)
-# 1. Execute torrent_stream.py
-# 2. Na janela de configuração, vá para aba "🔗 Addons"
-# 3. Adicione/remova URLs conforme necessário
-# 4. Clique "▶ Iniciar Servidor"
-
-# Múltiplos addons customizados
-GET /addons/search?name=Breaking%20Bad&season=1&episode=1&addons=https://addon1.com,https://addon2.net,https://addon3.org
+PORT=8080 python torrent_stream.py
 ```
 
-**Nota**: Os addons configurados na interface gráfica são salvos automaticamente e usados por padrão em todas as buscas.
+## Endpoints principais
 
-## Configuração de Porta
+### Saúde e controle
+- `GET /ping` — status do servidor
+- `GET /health` — saúde do engine + addons
+- `GET /addons/status` — ranking rápido dos addons
+- `GET /addons/config` — configuração atual de addons
+- `POST /addons/config` — definir addons customizados
+- `DELETE /addons/config` — voltar aos addons padrão
+- `GET /ffmpeg/status` — status do FFmpeg
 
-Por padrão, o servidor roda na porta 5000. Para usar uma porta diferente:
+### Busca de streams
+- `GET /addons/search` — buscar streams em Stremio addons
+
+Parâmetros úteis:
+- `name`
+- `imdb_id`
+- `kitsu_id`
+- `season`
+- `episode`
+- `nyaa`
+- `nyaa_trusted`
+- `addons`
+
+Exemplo:
 
 ```bash
-# Porta 8080
-PORT=8080 python3 torrent_stream.py
-
-# Porta 3000
-PORT=3000 python3 torrent_stream.py
-
-# Porta 9000
-PORT=9000 python3 torrent_stream.py
+curl "http://localhost:5000/addons/search?name=Jujutsu+Kaisen&season=1&episode=1&nyaa=true"
 ```
 
-**Nota**: Todas as URLs retornadas pela API usarão a porta configurada automaticamente.
+### Addons customizados
+- `GET /addons/config` retorna os addons configurados
+- `POST /addons/config` salva uma lista nova de addons
+- `DELETE /addons/config` restaura os addons padrão
 
-## Visão Geral do Projeto
-
-```
-torrent_stream/
-├── torrent_stream.py       # Aplicação principal (Flask + libtorrent)
-├── setup_ffmpeg.py         # Script de setup (baixa/vincula FFmpeg)
-├── vendor/                 # Dependências Python empacotadas
-│   ├── flask/
-│   ├── flask_cors/
-│   ├── pystray/
-│   └── ...
-├── ffmpeg_bin/             # Symlinks para FFmpeg (criado por setup_ffmpeg.py)
-└── .gitignore
-```
-
-## API Endpoints
-
-### Status & Health
-- `GET /` - Documentação da API
-- `GET /ping` - Status do servidor
-- `GET /status` - Status geral e torrents ativos
-- `GET /ffmpeg/status` - Status do FFmpeg
-- `GET /transcode/test` - Teste de transcodificação
-
-### Torrents
-- `POST /addons/start` - Iniciar torrent (magnet/infoHash)
-- `GET /stream/<info_hash>` - Stream direto do arquivo
-- `POST /stop` - Parar torrent
-
-### HLS / Transcodificação
-- `GET /hls/<info_hash>/index.m3u8` - Playlist HLS
-- `GET /hls/<info_hash>/<segment>` - Segmento HLS
-- `POST /hls/select-audio/<info_hash>` - Selecionar áudio
-- `GET /transcode/status/<info_hash>` - Status da transcodificação
-
-### Busca
-- `GET /search` - Busca combinada
-- `GET /addons/search` - Busca em Stremio addons (suporta addons customizados)
-- `GET /nyaa/search` - Busca Nyaa (anime)
-- `GET /tracks/<info_hash>` - Info de áudio/legendas
-
-### Legendas
-- `GET /subtitles/<info_hash>/<index>.vtt` - Extrair legenda (VTT)
-- `GET /subtitles/proxy` - Proxy para legendas remotas
-- `GET /translate-sub/<info_hash>/<index>` - Traduzir legenda
-
-### Smart TV (DLNA/UPnP)
-- `GET /cast/devices` - Listar Smart TVs
-- `POST /cast/play` - Enviar para TV
-- `POST /cast/stop` - Parar na TV
-- `POST /cast/pause` - Pausar na TV
-- `POST /cast/volume` - Ajustar volume
-
-### Server-Sent Events (SSE)
-- `GET /events/global` - Eventos globais
-- `GET /events/<info_hash>` - Eventos de um torrent
-
-## Exemplo de Uso
+Exemplo POST:
 
 ```bash
-# Iniciar servidor na porta padrão (5000)
-python3 torrent_stream.py
-
-# Iniciar servidor em porta customizada
-PORT=8080 python3 torrent_stream.py
-
-# Em outro terminal, fazer uma requisição de teste
-curl http://localhost:5000/
-
-# Ou na porta customizada
-curl http://localhost:8080/
-
-# Iniciar um torrent
-curl -X POST http://localhost:5000/addons/start \
-  -H "Content-Type: application/json" \
-  -d '{
-    "magnet": "magnet:?xt=urn:btih:08ada5c7c6ac0ec0e46cbbf5eb9245eb6d21feb9&dn=Sintel"
-  }'
-
-# Obter status
-curl http://localhost:5000/status | jq '.torrents[0]'
-
-# Ou na porta customizada:
-curl -X POST http://localhost:8080/addons/start \
-  -H "Content-Type: application/json" \
-  -d '{
-    "magnet": "magnet:?xt=urn:btih:08ada5c7c6ac0ec0e46cbbf5eb9245eb6d21feb9&dn=Sintel"
-  }'
-curl http://localhost:8080/status | jq '.torrents[0]'
-
-# Buscar streams usando addons padrão
-curl "http://localhost:5000/addons/search?name=Breaking%20Bad&season=1&episode=1"
-
-# Buscar usando addons customizados
-curl "http://localhost:5000/addons/search?name=Breaking%20Bad&season=1&episode=1&addons=https://meu-addon.com,https://outro-addon.net"
-
-# Acessar HLS
-curl http://localhost:5000/hls/08ada5c7c6ac0ec0e46cbbf5eb9245eb6d21feb9/index.m3u8
-
-# Ou na porta customizada:
-curl http://localhost:8080/hls/08ada5c7c6ac0ec0e46cbbf5eb9245eb6d21feb9/index.m3u8
+curl -X POST http://localhost:5000/addons/config   -H "Content-Type: application/json"   -d '{"addons": ["https://torrentio.strem.fun"]}'
 ```
 
-## Arquitetura
+### SSE (recomendado para UI)
+- `GET /events/global` — eventos globais do servidor
+- `GET /events/<info_hash>` — progresso do torrent específico
 
-```
-┌─────────────────────────────────────────────────────────┐
-│               TorrentStream (Flask)                      │
-├─────────────────────────────────────────────────────────┤
-│  Libtorrent Session (BitTorrent)                        │
-│  ├─ Download de metadata                               │
-│  ├─ Gerencimento de peers                              │
-│  └─ Buffer progressivo                                 │
-├─────────────────────────────────────────────────────────┤
-│  FFmpeg (HLS Transcoding)                               │
-│  ├─ Vídeo: H.264 (CPU/GPU)                             │
-│  ├─ Áudio: AAC (transcode se necessário)               │
-│  └─ Legendas: VTT (extração + tradução)                │
-├─────────────────────────────────────────────────────────┤
-│  DLNA/UPnP Control (Smart TV Casting)                   │
-├─────────────────────────────────────────────────────────┤
-│  APIs Externas                                          │
-│  ├─ Stremio Addons (busca de streams)                  │
-│  ├─ Nyaa (anime torrents)                              │
-│  ├─ Google Translate (legendas)                        │
-│  └─ IMDB/Kitsu (metadados)                             │
-└─────────────────────────────────────────────────────────┘
+Exemplo SSE em JavaScript:
+
+```js
+const source = new EventSource('http://localhost:5000/events/abc123def456');
+source.addEventListener('progress', event => {
+  const data = JSON.parse(event.data);
+  console.log('progress', data);
+});
 ```
 
-## Requisitos
+### Streaming de vídeo
+- `GET /stream/<info_hash>` — stream direto do arquivo
+- `GET /hls/<info_hash>/index.m3u8` — playlist HLS
+- `GET /hls/<info_hash>/<segment>` — segmentos HLS
 
-### Sistema
-- Python 3.8+
-- Linux/macOS/Windows
-- FFmpeg com ffprobe
+Exemplo HLS:
 
-### Python
-- Flask / Flask-CORS
-- libtorrent-rasterbar
-- requests
-- pystray (opcional, para system tray)
-
-## Desenvolvimento
-
-Para trabalhar com o projeto:
-
-```bash
-# Limpar cache Python
-find . -type d -name __pycache__ -exec rm -rf {} \;
-
-# Testar sintaxe
-python3 -m py_compile torrent_stream.py
-
-# Executar com debug
-PYTHONUNBUFFERED=1 python3 torrent_stream.py
+```html
+<video controls>
+  <source src="http://localhost:5000/hls/abc123def456/index.m3u8" type="application/x-mpegURL">
+</video>
 ```
 
-## Licença
+## Uso rápido
 
-Ver arquivo LICENSE
+1. `GET /health`
+2. `GET /addons/search?name=SeuAnime&season=1&episode=1`
+3. `GET /events/<info_hash>` via SSE
+4. `GET /hls/<info_hash>/index.m3u8`
+
+## Apenas um documento
+
+- Todos os outros arquivos markdown foram removidos.
+- Este `README.md` é o único guia oficial do projeto.

@@ -1581,6 +1581,20 @@ def bootstrap_magnet(magnet: str):
         "content_type": content_type,
     })
 
+    # ── Adicionar Webseed ────────────────────────────────────────────────────
+    try:
+        # Detectar IP local para webseed (fallback para localhost)
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        webseed_url = f"http://{local_ip}:{PORT}/stream/{info_hash}"
+        handle.add_url_seed(webseed_url)
+        print(f"🌐 Webseed adicionado: {webseed_url}")
+    except Exception as e:
+        print(f"⚠ Erro ao adicionar webseed: {e}")
+
     return handle, info_hash, file_path, file_size, content_type
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
@@ -2530,6 +2544,83 @@ def google_translate_v1(text: str, target_lang: str = "pt") -> str:
     return text
 
 
+# ── SEARCH RECOMMENDATIONS (NEW) ────────────────────────────────────────────
+def _generate_search_recommendations(
+    streams: List[dict], 
+    addon_urls: List[str],
+    search_duration_ms: float
+) -> List[str]:
+    """
+    Gera recomendações baseadas nos resultados da busca.
+    Ajuda a aplicação web a entender o que melhorar.
+    """
+    recommendations = []
+    
+    # Sem resultados
+    if not streams:
+        recommendations.append(
+            "❌ Nenhum stream encontrado. Tente com IDs diferentes (IMDB/Kitsu)."
+        )
+        
+        # Verificar addons offline
+        offline_addons = [
+            addon for addon in addon_urls 
+            if not check_addon_health(addon)
+        ]
+        if offline_addons:
+            recommendations.append(
+                f"⚠️  {len(offline_addons)} addon(s) offline: "
+                f"{', '.join(offline_addons[:2])}..."
+            )
+        
+        return recommendations
+    
+    # Busca lenta
+    if search_duration_ms > 10000:
+        recommendations.append(
+            f"⚠️  Busca lenta ({search_duration_ms:.0f}ms). "
+            "Verifique conexão ou considere remover addons lentos."
+        )
+    
+    # Poucos resultados
+    if len(streams) < 3:
+        recommendations.append(
+            f"⏬ Poucos resultados (apenas {len(streams)}). "
+            "Tente com título mais genérico ou IDs alternativos."
+        )
+    
+    # Verificar qualidade
+    qualities = [s.get("quality", "SD") for s in streams]
+    if quality_count := sum(q in ["1080P", "720P"] for q in qualities):
+        if quality_count < len(streams) // 2:
+            recommendations.append(
+                f"📊 Apenas {quality_count} streams de boa qualidade. "
+                "Mais resultados podem aparecer com espera."
+            )
+    else:
+        recommendations.append(
+            "📺 Nenhum stream de alta qualidade encontrado. "
+            "Considere aceitar qualidade menor."
+        )
+    
+    # Performance dos addons
+    slow_addons = [
+        addon for addon in addon_urls
+        if get_addon_score(addon) < 30
+    ]
+    if slow_addons:
+        recommendations.append(
+            f"🐢 {len(slow_addons)} addon(s) com performance baixa. "
+            f"Use `/addons/config` para remover ou substituir."
+        )
+    
+    # Sem recomendações
+    if not recommendations:
+        recommendations.append("✅ Busca bem-sucedida com bons resultados!")
+    
+    return recommendations
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── FLASK ROUTES ──────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2591,6 +2682,153 @@ def index():
 @app.route("/ping")
 def ping():
     return jsonify({"status": "online", "version": "3.2.0"})
+
+
+# ── /health (NEW) ────────────────────────────────────────────────────────────
+# Endpoint de diagnóstico completo para validar saúde do engine
+@app.route("/health")
+def health_check():
+    """
+    Diagnóstico completo do engine Stremio.
+    
+    Retorna:
+    - Status geral (ok/degraded/error)
+    - Status de cada addon (online/offline)
+    - Performance scores
+    - Estatísticas de cache
+    """
+    addon_urls = STREMIO_ADDONS.copy()
+    
+    # ── Status de cada addon ──
+    addon_status = {}
+    for addon in addon_urls:
+        manifest = get_addon_manifest(addon)
+        health = check_addon_health(addon)
+        score = get_addon_score(addon)
+        stats = ADDON_STATS.get(addon, {})
+        
+        addon_status[addon] = {
+            "online": health,
+            "score": round(score, 1),
+            "successes": stats.get("successes", 0),
+            "failures": stats.get("failures", 0),
+            "avg_response_ms": round(
+                statistics.mean(stats.get("times", [0])), 1
+            ) if stats.get("times") else 0,
+            "supported_types": manifest.get("supportedTypes", []) if manifest else [],
+        }
+    
+    # ── Contar addons online ──
+    online_count = sum(1 for a in addon_status.values() if a["online"])
+    total_count = len(addon_status)
+    
+    # ── Status geral ──
+    if online_count == total_count:
+        overall_status = "ok"
+    elif online_count > total_count // 2:
+        overall_status = "degraded"
+    else:
+        overall_status = "error"
+    
+    # ── Cache stats ──
+    cache_size = len(STREAMS_CACHE) if isinstance(STREAMS_CACHE, dict) else "N/A"
+    
+    return jsonify({
+        "status": overall_status,
+        "message": f"{online_count}/{total_count} addons online",
+        "addons": addon_status,
+        "cache": {
+            "size": cache_size,
+            "type": "TTLCache" if _has_cachetools else "Dict",
+        },
+        "stats": {
+            "total_tracked_addons": len(ADDON_STATS),
+            "total_tracked_requests": sum(
+                s.get("successes", 0) + s.get("failures", 0)
+                for s in ADDON_STATS.values()
+            ),
+        },
+    })
+
+
+# ── /addons/status (NEW) ────────────────────────────────────────────────────
+# Status rápido dos addons
+@app.route("/addons/status")
+def addons_status():
+    """Retorna status rápido de todos os addons (sem fazer health check)"""
+    addon_urls = STREMIO_ADDONS.copy()
+    
+    addon_list = []
+    for addon in addon_urls:
+        score = get_addon_score(addon)
+        stats = ADDON_STATS.get(addon, {})
+        
+        addon_list.append({
+            "url": addon,
+            "score": round(score, 1),
+            "requests_success": stats.get("successes", 0),
+            "requests_failed": stats.get("failures", 0),
+            "last_success": (
+                int(stats.get("last_success", 0)) 
+                if stats.get("last_success") else None
+            ),
+        })
+    
+    return jsonify({
+        "addons": sorted(addon_list, key=lambda x: x["score"], reverse=True),
+    })
+
+
+# ── /addons/config (NEW) ────────────────────────────────────────────────────
+# Gerenciar addons customizados
+@app.route("/addons/config", methods=["GET"])
+def get_addons_config():
+    """Retorna configuração atual de addons"""
+    custom = load_custom_addons()
+    
+    return jsonify({
+        "default_addons": STREMIO_ADDONS,
+        "custom_addons": custom,
+        "active_addons": custom if custom else STREMIO_ADDONS,
+    })
+
+
+@app.route("/addons/config", methods=["POST"])
+def set_addons_config():
+    """Define addons customizados (lista de URLs)"""
+    data = request.get_json(silent=True) or {}
+    addons = data.get("addons", [])
+    
+    if not isinstance(addons, list):
+        return jsonify({"error": "addons deve ser uma lista de URLs"}), 400
+    
+    if not addons:
+        return jsonify({"error": "Liste de addons vazia"}), 400
+    
+    # Validar URLs básico
+    for addon in addons:
+        if not isinstance(addon, str) or not addon.startswith("http"):
+            return jsonify({
+                "error": f"URL inválida: {addon}"
+            }), 400
+    
+    save_custom_addons(addons)
+    
+    return jsonify({
+        "message": f"{len(addons)} addons salvos",
+        "addons": addons,
+    })
+
+
+@app.route("/addons/config", methods=["DELETE"])
+def reset_addons_config():
+    """Resetar para addons padrão"""
+    save_custom_addons([])
+    
+    return jsonify({
+        "message": "Addons resetados",
+        "addons": STREMIO_ADDONS,
+    })
 
 
 # ── /ffmpeg/status ────────────────────────────────────────────────────────────
@@ -2956,21 +3194,58 @@ def addon_search():
             if fut_kitsu:
                 kitsu_id = fut_kitsu.result()
 
+    # Medir tempo para diagnóstico
+    search_start = time.time()
+    
     streams = search_all_sources(
         name=name, season=season, episode=episode,
         imdb_id=imdb_id, kitsu_id=kitsu_id,
         use_nyaa=use_nyaa, nyaa_trusted=nyaa_trusted,
         addon_urls=addon_urls,  # Passa os addons customizados
     )
+    
+    search_duration_ms = (time.time() - search_start) * 1000
+    
+    # ── Compilar dados de diagnóstico ──
+    addon_scores = {
+        addon: get_addon_score(addon) 
+        for addon in addon_urls
+    }
+    
+    # Agrupar streams por fonte
+    streams_by_source = {}
+    for stream in streams:
+        source = stream.get("source", "unknown")
+        if source not in streams_by_source:
+            streams_by_source[source] = []
+        streams_by_source[source].append(stream)
 
     return jsonify({
         "total":   len(streams),
         "streams": streams,
         "meta": {
-            "name": name, "imdb_id": imdb_id, "kitsu_id": kitsu_id,
-            "season": season, "episode": episode,
-            "addons_used": addon_urls,
+            "name": name, 
+            "imdb_id": imdb_id, 
+            "kitsu_id": kitsu_id,
+            "season": season, 
+            "episode": episode,
+            "duration_ms": round(search_duration_ms, 1),
         },
+        "sources": {
+            "addons_used": addon_urls,
+            "addon_scores": {
+                addon: round(score, 1) 
+                for addon, score in addon_scores.items()
+            },
+            "streams_per_source": {
+                source: len(items)
+                for source, items in streams_by_source.items()
+            },
+            "nyaa_used": use_nyaa,
+        },
+        "recommendations": _generate_search_recommendations(
+            streams, addon_urls, search_duration_ms
+        ),
     })
 
 
